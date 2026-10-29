@@ -1,0 +1,12 @@
+set_marker:
+  fields:
+    name:
+      required: true
+      example: "away_mode"
+      selector:
+        text:
+    value:
+      required: true
+      example: true
+      selector:
+        text:

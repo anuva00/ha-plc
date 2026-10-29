@@ -1,0 +1,21 @@
+{
+  "domain": "ha_ladder",
+  "name": "Ladder Logic",
+  "codeowners": [
+    "@anuva00"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "http",
+    "frontend",
+    "panel_custom",
+    "websocket_api"
+  ],
+  "documentation": "https://github.com/anuva00/ha-plc",
+  "integration_type": "service",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/anuva00/ha-plc/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "0.1.1"
+}

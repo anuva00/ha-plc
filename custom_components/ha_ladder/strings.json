@@ -1,0 +1,29 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Ladder Logic",
+        "description": "Adds a PLC-style ladder logic editor to the sidebar and a scan-cycle runtime that executes your programs."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Ladder Logic is already set up."
+    }
+  },
+  "services": {
+    "set_marker": {
+      "name": "Set marker",
+      "description": "Set an internal ladder memory marker (#name) or counter value (#C1.CV).",
+      "fields": {
+        "name": {
+          "name": "Name",
+          "description": "Marker name without the # (e.g. away_mode)."
+        },
+        "value": {
+          "name": "Value",
+          "description": "true/false, a number, or text."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,52 @@
+<!doctype html><html><head><meta charset="utf-8"><style>html,body{margin:0;height:100%}</style></head>
+<body><ha-ladder-panel id="p" style="height:100vh"></ha-ladder-panel>
+<script src="../../custom_components/ha_ladder/frontend/ladder-panel.js"></script>
+<script>
+const st = (s, a={}) => ({state: s, attributes: a});
+const states = {
+  "binary_sensor.hallway_motion": st("on", {friendly_name: "Hallway Motion"}),
+  "binary_sensor.front_door": st("off", {friendly_name: "Front Door"}),
+  "light.hallway": st("on", {friendly_name: "Hallway Light", brightness: 200}),
+  "sensor.living_lux": st("35", {friendly_name: "Living Lux", unit_of_measurement: "lx"}),
+  "person.me": st("home", {friendly_name: "Me"}),
+  "sun.sun": st("below_horizon", {elevation: -12}),
+  "switch.porch": st("off", {friendly_name: "Porch Light"}),
+};
+const sample = [{id:"main", name:"Hallway", enabled:true, rungs:[
+ {id:"r1", comment:"Hall light on motion after dark, 2 min run-on", enabled:true,
+  logic:{id:"s1",t:"series",items:[
+    {id:"p1",t:"parallel",branches:[
+      {id:"b1",t:"series",items:[{id:"e1",t:"el",type:"NO",tag:"binary_sensor.hallway_motion"}]},
+      {id:"b2",t:"series",items:[{id:"e2",t:"el",type:"P",tag:"binary_sensor.front_door"},{id:"e2b",t:"el",type:"CMP",a:"person.me",op:"==",b:"'home'"}]}]},
+    {id:"e3",t:"el",type:"SUN",mode:"below",elevation:"0"},
+    {id:"e4",t:"el",type:"TOF",name:"T1",pt:"120"}]},
+  outputs:[{id:"o1",t:"el",type:"COIL",tag:"light.hallway"},{id:"o2",t:"el",type:"SET",tag:"#hall_used"}]},
+ {id:"r2", comment:"Count door openings, notify at 10", enabled:true,
+  logic:{id:"s2",t:"series",items:[{id:"f1",t:"el",type:"NO",tag:"binary_sensor.front_door"},{id:"f2",t:"el",type:"CTU",name:"C1",pv:"10",reset:"#reset_count"}]},
+  outputs:[{id:"o3",t:"el",type:"NOTIFY",service:"notify.mobile_app_phone",message:"Door opened {#C1.CV} times"}]},
+ {id:"r3", comment:"", enabled:true, logic:{id:"s3",t:"series",items:[{id:"g1",t:"el",type:"NC",tag:"#hall_used"},{id:"g2",t:"el",type:"RANGE",a:"sensor.living_lux",min:"0",max:"50"}]}, outputs:[]},
+]}];
+window.saved = null; window.calls = [];
+let monCb = null;
+const hass = {
+  states, services: {light:{turn_on:{},turn_off:{}}, notify:{mobile_app_phone:{}}},
+  callWS: async (m) => { calls.push(m);
+    if (m.type==="ha_ladder/get") return {programs: JSON.parse(JSON.stringify(sample)), settings:{scan_ms:250}, running:true};
+    if (m.type==="ha_ladder/save") { saved = m.programs; return {ok:true}; }
+    return {ok:true}; },
+  connection: { subscribeMessage: (cb) => { monCb = cb; setTimeout(push, 50); return Promise.resolve(() => {}); } },
+};
+function push() {
+  monCb({running:true, m:{
+    s1:[true,true,null], p1:[true,true,null], b1:[true,true,null], b2:[true,false,null],
+    e1:[true,true,true], e2:[true,false,false], e2b:[false,false,"home == home"], e3:[true,true,"-12°"], e4:[true,true,"0/120s"],
+    o1:[true,true,true], o2:[true,true,true],
+    s2:[true,false,null], f1:[true,false,false], f2:[false,false,"3/10"], o3:[false,false,null],
+    s3:[true,true,null], g1:[true,false,true], g2:[false,false,"35"]},
+    e:{}, mem:{hall_used:true, reset_count:false}, ctr:{C1:{cv:3,q:false}}, tmr:{T1:{q:true,et:0}},
+    stats:{count:1234,last_ms:0.21,max_ms:1.4,errors:0,scan_ms:250}});
+}
+const p = document.getElementById("p");
+p.narrow = location.hash === "#narrow";
+p.hass = hass;
+</script></body></html>
