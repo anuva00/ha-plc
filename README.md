@@ -53,7 +53,9 @@ Numbers written with MOVE/MATH: input_number/number value, light brightness %,
 cover position, fan %, climate setpoint, media_player volume (0–1).
 
 ## Editor
-Select a rung or an element, then click an instruction in the palette to insert it after
+**Drag and drop:** drag instructions from the palette onto a rung, and drag placed elements to move them, within a rung or to another rung. Drop on a wire to insert in series, just below an element to OR it, or on the palette to delete. Drag the ⠿ handle to reorder rungs. On touch screens, press and hold to start a drag.
+
+You can also select a rung or an element, then click an instruction in the palette to insert it after
 the selection. Coils and actions go to the right-hand column. **OR branch** wraps the
 selection in a parallel path. Shift-click selects several elements side by side. Click a
 marker or counter in the Watch panel to modify it while the program is running.

@@ -4,7 +4,7 @@ const CW = 124;        // cell width
 const CH = 92;         // cell height
 const WY = 50;         // wire y inside a cell
 const RAIL = 14;       // rail inset
-const VERSION = "0.1.1";
+const VERSION = "0.1.2";
 
 const PALETTE = [
   { group: "Bit logic", items: [
@@ -170,6 +170,10 @@ class LadderPanel extends HTMLElement {
     this.redo = [];
     this.settings = { scan_ms: 250 };
     this._lastTick = 0;
+    this._zones = {};
+    this._drag = null;
+    this._onDragMove = this._onDragMove.bind(this);
+    this._onDragEnd = this._onDragEnd.bind(this);
     this._loaded = false;
     try { this.theme = localStorage.getItem("ha_ladder_theme") || "auto"; } catch (e) { this.theme = "auto"; }
   }
@@ -455,8 +459,15 @@ class LadderPanel extends HTMLElement {
       ${g.items.map(([t, sym, d]) => `<button class="pitem" data-type="${t}" title="${esc(d)}"><span class="sym">${esc(sym)}</span><span class="pname">${SHORT[t] || t}</span></button>`).join("")}
       </div>`).join("");
     $("palette").addEventListener("click", (e) => {
+      if (this._suppressClick) return;
       const b = e.target.closest("[data-type]"); if (b) this._insert(b.dataset.type);
     });
+    $("palette").addEventListener("pointerdown", (e) => {
+      const b = e.target.closest("[data-type]"); if (!b || e.button > 0) return;
+      if (e.pointerType === "mouse") e.preventDefault();
+      this._dragStart(e, { kind: "new", type: b.dataset.type });
+    });
+    this.shadowRoot.addEventListener("touchmove", (e) => { if (this._drag && this._drag.active) e.preventDefault(); }, { passive: false });
     const canvas = $("canvas");
     canvas.addEventListener("pointerdown", (e) => this._canvasPointer(e));
     canvas.addEventListener("click", (e) => this._canvasClick(e));
@@ -538,7 +549,7 @@ class LadderPanel extends HTMLElement {
       ${prog.rungs.map((r, i) => `
         <section class="rung ${this.sel && this.sel.rung === r.id ? "rsel" : ""} ${r.enabled ? "" : "disabled"}" data-rung="${r.id}">
           <div class="rhead">
-            <span class="rnum">${i + 1}</span>
+            <span class="rnum" data-rhandle="${r.id}" title="Drag to reorder">⠿ ${i + 1}</span>
             <input class="comment" data-comment="${r.id}" placeholder="Rung comment…" value="${esc(r.comment || "")}">
             <span class="rerr" data-rerr="${r.id}"></span>
             <label class="chk" title="Disabled rungs are skipped"><input type="checkbox" data-rungenable="${r.id}" ${r.enabled ? "checked" : ""}> on</label>
@@ -561,9 +572,15 @@ class LadderPanel extends HTMLElement {
   }
 
   _canvasPointer(e) {
+    if (e.button > 0) return;
     const hit = e.target.closest("[data-id]");
     const rungEl = e.target.closest("[data-rung]");
+    const handle = e.target.closest("[data-rhandle]");
+    if (handle) { e.preventDefault(); this._dragStart(e, { kind: "rung", id: handle.dataset.rhandle }); return; }
     if (e.target.closest("input,button,label,select,textarea")) return;
+    if (hit && !e.shiftKey) this._dragStart(e, { kind: "move", id: hit.dataset.id });
+    else if (e.pointerType !== "mouse" && e.target.closest(".svgwrap")) this._dragStart(e, null);
+    if (hit && e.pointerType !== "mouse") return; // touch: select on release, so swiping to scroll doesn't select
     if (hit) {
       const id = hit.dataset.id, rung = hit.closest("[data-rung]").dataset.rung;
       if (e.shiftKey && this.sel && this.sel.rung === rung) {
@@ -578,6 +595,13 @@ class LadderPanel extends HTMLElement {
       this.sel = { rung: rungEl.dataset.rung, ids: [] };
     } else return;
     this.shadowRoot.querySelectorAll(".rung").forEach((r) => r.classList.toggle("rsel", this.sel && r.dataset.rung === this.sel.rung));
+    this._updateSvgs();
+    this._renderProps();
+  }
+  _selectId(id) {
+    const loc = this._locate(id); if (!loc) return;
+    this.sel = { rung: loc.rung.id, ids: [id] };
+    this.shadowRoot.querySelectorAll(".rung").forEach((r) => r.classList.toggle("rsel", r.dataset.rung === loc.rung.id));
     this._updateSvgs();
     this._renderProps();
   }
@@ -627,6 +651,197 @@ class LadderPanel extends HTMLElement {
     this.shadowRoot.getElementById("file").value = "";
   }
 
+  /* ---------- drag & drop ---------- */
+  _dragStart(e, payload) {
+    this._dragCleanup();
+    const d = { payload, x0: e.clientX, y0: e.clientY, lx: e.clientX, ly: e.clientY, id: e.pointerId, touch: e.pointerType !== "mouse", active: false };
+    // touch-action is "none" on draggable areas, so on touch we scroll these ourselves until a long-press starts a drag
+    const wrap = e.target.closest && e.target.closest(".svgwrap");
+    d.scrollEls = e.target.closest && e.target.closest(".palette")
+      ? [this.shadowRoot.getElementById("palette")]
+      : [wrap, this.shadowRoot.getElementById("canvas")].filter(Boolean);
+    this._drag = d;
+    if (d.touch && payload) d.timer = setTimeout(() => { if (this._drag === d && !d.moved) this._dragActivate(e.clientX, e.clientY); }, 260);
+    window.addEventListener("pointermove", this._onDragMove);
+    window.addEventListener("pointerup", this._onDragEnd);
+    window.addEventListener("pointercancel", this._onDragEnd);
+  }
+  _dragActivate(cx, cy) {
+    const d = this._drag; if (!d || !d.payload) return;
+    d.active = true;
+    if (navigator.vibrate && d.touch) try { navigator.vibrate(15); } catch (e) { /* ignore */ }
+    const p = d.payload;
+    let label = "";
+    if (p.kind === "new") label = (PALETTE.flatMap((g) => g.items).find((i) => i[0] === p.type) || [p.type, p.type])[1];
+    else if (p.kind === "move") { const loc = this._locate(p.id); label = loc ? (loc.node.t === "parallel" ? "OR branch" : loc.node.type) : "?"; }
+    else label = "Rung " + (this.prog.rungs.findIndex((r) => r.id === p.id) + 1);
+    const g = document.createElement("div");
+    g.className = "ghost";
+    g.textContent = label;
+    this.shadowRoot.querySelector(".app").appendChild(g);
+    d.ghost = g;
+    this.toggleAttribute("dragging", true);
+    if (p.kind === "move") this.shadowRoot.getElementById("palette").classList.add("trash");
+    if (p.kind === "move") this._updateSvgs();
+    d.scroller = setInterval(() => { if (d.vscroll) this.shadowRoot.getElementById("canvas").scrollTop += d.vscroll; }, 16);
+    this._dragMoveTo(cx, cy);
+  }
+  _onDragMove(e) {
+    const d = this._drag; if (!d || e.pointerId !== d.id) return;
+    const dist = Math.hypot(e.clientX - d.x0, e.clientY - d.y0);
+    if (!d.active) {
+      if (d.touch) {
+        if (dist > 8 || d.moved) {
+          d.moved = true; clearTimeout(d.timer);
+          const dx = e.clientX - d.lx, dy = e.clientY - d.ly;
+          for (const el of d.scrollEls) { el.scrollLeft -= dx; el.scrollTop -= dy; }
+          this._suppressClick = true;
+        }
+        d.lx = e.clientX; d.ly = e.clientY;
+        return;
+      }
+      if (dist > 6) this._dragActivate(e.clientX, e.clientY);
+      return;
+    }
+    e.preventDefault();
+    this._dragMoveTo(e.clientX, e.clientY);
+  }
+  _dragMoveTo(cx, cy) {
+    const d = this._drag;
+    d.ghost.style.transform = `translate(${cx + 14}px, ${cy + 10}px)`;
+    const main = this.shadowRoot.getElementById("canvas").getBoundingClientRect();
+    d.vscroll = cy < main.top + 50 ? -12 : cy > main.bottom - 50 ? 12 : 0;
+    this.shadowRoot.querySelectorAll(".dropind").forEach((n) => n.remove());
+    this.shadowRoot.querySelectorAll(".rdrop-before,.rdrop-after").forEach((n) => n.classList.remove("rdrop-before", "rdrop-after"));
+    const pal = this.shadowRoot.getElementById("palette");
+    const pr = pal.getBoundingClientRect();
+    d.overTrash = d.payload.kind === "move" && cx >= pr.left && cx <= pr.right && cy >= pr.top && cy <= pr.bottom;
+    pal.classList.toggle("trashhot", d.overTrash);
+    d.target = null;
+    if (d.overTrash) return;
+    if (d.payload.kind === "rung") { this._rungDropTarget(cx, cy); return; }
+    let best = null;
+    for (const host of this.shadowRoot.querySelectorAll("[data-svg]")) {
+      const svg = host.querySelector("svg"); if (!svg) continue;
+      const r = svg.getBoundingClientRect();
+      if (cy < r.top - 20 || cy > r.bottom + 20 || cx < r.left - 20 || cx > r.right + 20) continue;
+      const lx = cx - r.left, ly = cy - r.top, rid = host.dataset.svg;
+      for (const z of this._zones[rid] || []) {
+        if (!this._zoneOk(z, d.payload)) continue;
+        const dist = Math.hypot((lx - z.x) * 0.8, ly - z.y);
+        if (dist < 70 && (!best || dist < best.dist)) best = { z, dist, rid, svg };
+      }
+    }
+    if (!best) return;
+    d.target = { z: best.z, rung: best.rid };
+    best.svg.insertAdjacentHTML("beforeend", this._dropIndicator(best.z));
+  }
+  _rungDropTarget(cx, cy) {
+    const secs = [...this.shadowRoot.querySelectorAll("section.rung")];
+    if (!secs.length) return;
+    let idx = secs.length;
+    for (let i = 0; i < secs.length; i++) {
+      const r = secs[i].getBoundingClientRect();
+      if (cy < r.top + r.height / 2) { idx = i; break; }
+    }
+    if (idx < secs.length) secs[idx].classList.add("rdrop-before");
+    else secs[secs.length - 1].classList.add("rdrop-after");
+    this._drag.target = { rungIndex: idx };
+  }
+  _dropIndicator(z) {
+    // svg markup appended to the hovered rung
+    if (z.kind === "ins") return `<g class="dropind"><line x1="${z.x}" y1="${z.y - 26}" x2="${z.x}" y2="${z.y + 26}"/><circle cx="${z.x}" cy="${z.y}" r="6"/></g>`;
+    if (z.kind === "out") return `<g class="dropind"><rect x="${z.x - CW / 2 + 10}" y="${z.y - 3}" width="${CW - 20}" height="6" rx="3"/><circle cx="${z.x - CW / 2 + 10}" cy="${z.y}" r="5"/></g>`;
+    return `<g class="dropind box"><rect x="${z.x - CW / 2 + 8}" y="${z.y - 12}" width="${CW - 16}" height="30" rx="8"/><text x="${z.x}" y="${z.y + 7}" text-anchor="middle">${z.kind === "or" ? "OR ⤵" : "+ branch"}</text></g>`;
+  }
+  _zoneOk(z, p) {
+    let type = p.type, node = null;
+    if (p.kind === "move") {
+      const loc = this._locate(p.id); if (!loc) return false;
+      node = loc.node; type = node.t === "el" ? node.type : "__par";
+    }
+    const isOut = OUTPUT_TYPES.has(type);
+    if (z.kind === "out" && !isOut) return false;
+    if ((z.kind === "or" || z.kind === "branch") && isOut) return false;
+    if (node) {
+      if (z.kind === "or" && z.node === node) return false;
+      // can't drop a parallel inside itself
+      let inside = false;
+      const target = z.series || z.par || z.node;
+      if (target) walk(node, (n) => { if (n === target) inside = true; });
+      if (inside) return false;
+    }
+    return true;
+  }
+  _onDragEnd(e) {
+    const d = this._drag; if (!d || (e && e.pointerId !== d.id)) return;
+    if (d.moved) setTimeout(() => { this._suppressClick = false; }, 0);
+    const wasActive = d.active, target = e && e.type === "pointercancel" ? null : d.target, trash = d.overTrash && e && e.type !== "pointercancel";
+    this._dragCleanup();
+    if (!wasActive) {
+      if (d.touch && !d.moved && e && e.type === "pointerup" && d.payload && d.payload.kind === "move") this._selectId(d.payload.id);
+      return;
+    }
+    this._suppressClick = true;
+    setTimeout(() => { this._suppressClick = false; }, 0);
+    const p = d.payload;
+    if (trash && p.kind === "move") { this.sel = { rung: (this._locate(p.id) || {}).rung?.id, ids: [p.id] }; this._delete(); this._toast("Deleted — Ctrl+Z to undo"); return; }
+    if (!target) { this._render(); return; }
+    if (p.kind === "rung") {
+      const rs = this.prog.rungs, from = rs.findIndex((r) => r.id === p.id);
+      let to = target.rungIndex; if (to > from) to--;
+      if (from < 0 || to === from) { this._render(); return; }
+      this._mutate(() => { const [r] = rs.splice(from, 1); rs.splice(to, 0, r); this.sel = { rung: r.id, ids: [] }; });
+      return;
+    }
+    this._applyDrop(target.z, target.rung, p);
+  }
+  _applyDrop(z, rungId, p) {
+    let node = null;
+    this._mutate(() => {
+      const GONE = { t: "__gone", id: "__gone" };
+      if (p.kind === "new") node = this._newElement(p.type);
+      else {
+        const loc = this._locate(p.id); if (!loc) return;
+        node = loc.node;
+        const arr = loc.where === "outputs" ? loc.rung.outputs : loc.parent.items;
+        arr[arr.indexOf(node)] = GONE;
+      }
+      const rung = this._rung(rungId);
+      if (z.kind === "ins") z.series.items.splice(z.index, 0, node);
+      else if (z.kind === "out") rung.outputs.splice(z.index, 0, node);
+      else if (z.kind === "or") {
+        const i = z.series.items.indexOf(z.node);
+        z.series.items.splice(i, 1, { id: uid(), t: "parallel", branches: [
+          { id: uid(), t: "series", items: [z.node] },
+          { id: uid(), t: "series", items: [node] },
+        ]});
+      } else if (z.kind === "branch") z.par.branches.push({ id: uid(), t: "series", items: [node] });
+      for (const r of this.prog.rungs) {
+        r.outputs = r.outputs.filter((o) => o !== GONE);
+        walk(r.logic, (n) => { if (n.t === "series") n.items = n.items.filter((it) => it !== GONE); });
+      }
+      this.sel = { rung: rungId, ids: [node.id] };
+    });
+    if (p.kind === "new") this._focusFirstField();
+  }
+  _dragCleanup() {
+    const d = this._drag; if (!d) return;
+    clearTimeout(d.timer);
+    clearInterval(d.scroller);
+    if (d.ghost) d.ghost.remove();
+    window.removeEventListener("pointermove", this._onDragMove);
+    window.removeEventListener("pointerup", this._onDragEnd);
+    window.removeEventListener("pointercancel", this._onDragEnd);
+    this._drag = null;
+    this.removeAttribute("dragging");
+    const pal = this.shadowRoot.getElementById("palette");
+    if (pal) pal.classList.remove("trash", "trashhot");
+    this.shadowRoot.querySelectorAll(".dropind").forEach((n) => n.remove());
+    this.shadowRoot.querySelectorAll(".rdrop-before,.rdrop-after").forEach((n) => n.classList.remove("rdrop-before", "rdrop-after"));
+    if (d.active && d.payload.kind === "move") this._updateSvgs();
+  }
+
   /* ---------- SVG ---------- */
   _updateSvgs() {
     const prog = this.prog; if (!prog) return;
@@ -649,8 +864,8 @@ class LadderPanel extends HTMLElement {
     const nOut = Math.max(1, rung.outputs.length);
     const rows = Math.max(L.h, nOut);
     const W = RAIL * 2 + (cols + 1) * CW + 20;
-    const H = rows * CH + 6;
-    const ctx = { out: [], live: this._live() && rung.enabled && this.prog.enabled, m: (this.mon && this.mon.m) || {} };
+    const H = rows * CH + 28;
+    const ctx = { zones: [], out: [], live: this._live() && rung.enabled && this.prog.enabled, m: (this.mon && this.mon.m) || {} };
     const x = (c) => RAIL + c * CW, y = (r) => r * CH + WY;
     const rightRail = x(cols + 1) + 20;
     const railCls = ctx.live ? "rail on" : "rail";
@@ -672,37 +887,57 @@ class LadderPanel extends HTMLElement {
       this._drawEl(o, oc, k, ctx, rp);
       ctx.out.push(`<line class="${this._wc(ctx, ctx.m[o.id] ? ctx.m[o.id][1] : undefined)}" x1="${x(oc + 1)}" y1="${y(k)}" x2="${rightRail}" y2="${y(k)}"/>`);
     });
-    if (!rung.logic.items.length) {
-      ctx.out.push(`<text class="hint" x="${x(0) + 14}" y="${y(0) - 10}">select this rung, then pick a contact from the palette</text>`);
+    // output column drop zones
+    const ox = x(oc) + CW / 2;
+    if (!rung.outputs.length) ctx.zones.push({ kind: "out", index: 0, x: ox, y: y(0) });
+    else for (let k = 0; k <= rung.outputs.length; k++) {
+      ctx.zones.push({ kind: "out", index: k, x: ox, y: k === 0 ? y(0) - 34 : k === rung.outputs.length ? y(k - 1) + 40 : (y(k - 1) + y(k)) / 2 });
     }
+    if (!rung.logic.items.length) {
+      ctx.out.push(`<text class="hint" x="${x(0) + 14}" y="${y(0) - 10}">drag an instruction here, or select the rung and click one in the palette</text>`);
+    }
+    this._zones[rung.id] = ctx.zones;
     return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">${ctx.out.join("")}</svg>`;
   }
   _wc(ctx, p) { return !ctx.live || p === undefined ? "wire" : p ? "wire on" : "wire off"; }
 
-  _drawNode(n, c, r, W, ctx, top = false) {
+  _drawNode(n, c, r, W, ctx, inBranch = false) {
     const x = (cc) => RAIL + cc * CW, y = (rr) => rr * CH + WY;
     const md = ctx.m[n.id];
     if (n.t === "el") return this._drawEl(n, c, r, ctx, md ? md[0] : undefined);
     if (n.t === "series") {
       const pin = md ? md[0] : undefined, pout = md ? md[1] : undefined;
+      const Z = ctx.zones, inset = inBranch ? 16 : 0;
       if (!n.items.length) {
         ctx.out.push(`<line class="${this._wc(ctx, pin)}" x1="${x(c)}" y1="${y(r)}" x2="${x(c + W)}" y2="${y(r)}"/>`);
+        Z.push({ kind: "ins", series: n, index: 0, x: x(c) + (W * CW) / 2, y: y(r) });
         return;
       }
       let cc = c;
-      for (const it of n.items) { const s = sizeOf(it); this._drawNode(it, cc, r, s.w, ctx); cc += s.w; }
-      if (cc < c + W) ctx.out.push(`<line class="${this._wc(ctx, pout)}" x1="${x(cc)}" y1="${y(r)}" x2="${x(c + W)}" y2="${y(r)}"/>`);
+      n.items.forEach((it, i) => {
+        Z.push({ kind: "ins", series: n, index: i, x: x(cc) + (i === 0 ? inset : 0), y: y(r) });
+        const s = sizeOf(it);
+        this._drawNode(it, cc, r, s.w, ctx);
+        if (it.t === "el") Z.push({ kind: "or", node: it, series: n, x: x(cc) + CW / 2, y: y(r) + 56 });
+        cc += s.w;
+      });
+      Z.push({ kind: "ins", series: n, index: n.items.length, x: x(cc) - inset, y: y(r) });
+      if (cc < c + W) {
+        ctx.out.push(`<line class="${this._wc(ctx, pout)}" x1="${x(cc)}" y1="${y(r)}" x2="${x(c + W)}" y2="${y(r)}"/>`);
+        if (!inBranch && c + W - cc >= 1) Z.push({ kind: "ins", series: n, index: n.items.length, x: (x(cc) + x(c + W)) / 2, y: y(r) });
+      }
       return;
     }
     // parallel
     let rr = r; const rowsAt = [];
     for (const b of n.branches) {
       rowsAt.push(rr);
-      this._drawNode(b, c, rr, W, ctx);
+      this._drawNode(b, c, rr, W, ctx, true);
       // branch filler is handled inside series; each branch end goes to right bus
       rr += sizeOf(b).h;
     }
     const last = rowsAt[rowsAt.length - 1];
+    ctx.zones.push({ kind: "branch", par: n, x: x(c) + CW / 2, y: y(rr - 1) + 44 + (sizeOf(n.branches[n.branches.length - 1]).h > 1 ? 0 : 0), by: rr });
     const pin = md ? md[0] : undefined, pout = md ? md[1] : undefined;
     ctx.out.push(`<line class="${this._wc(ctx, pin)}" x1="${x(c)}" y1="${y(r)}" x2="${x(c)}" y2="${y(last)}"/>`);
     // right bus: colour each segment by whether any branch at/below feeds it
@@ -758,7 +993,8 @@ class LadderPanel extends HTMLElement {
     const o = ctx.out;
     const wcIn = this._wc(ctx, pin), wcOut = this._wc(ctx, po);
     const t = el.type;
-    o.push(`<g class="el ${sel ? "sel" : ""} ${err ? "err" : ""}" data-id="${el.id}">`);
+    const dragging = this._drag && this._drag.active && this._drag.payload.id === el.id;
+    o.push(`<g class="el ${sel ? "sel" : ""} ${err ? "err" : ""} ${dragging ? "dragging" : ""}" data-id="${el.id}">`);
     o.push(`<rect class="hit" x="${x0 + 3}" y="${yy - 46}" width="${CW - 6}" height="${CH - 4}" rx="8"/>`);
     if (err) o.push(`<title>${esc(err)}</title>`);
     const label = (tag, yOff = 36) => {
@@ -997,7 +1233,8 @@ class LadderPanel extends HTMLElement {
       ${cRows ? `<div class="wtitle">Counters</div><table class="kv">${cRows}</table>` : ""}
       <div class="wtitle">How it works</div>
       <ul class="help">
-        <li>Select a rung (or an element), then click an instruction in the palette to insert it after the selection. Coils & actions go to the right-hand column.</li>
+        <li><b>Drag</b> instructions from the palette onto a rung, and drag anything already placed to move it: drop on a wire to insert in series, just below an element to make an OR branch, or onto the palette to delete. Drag ⠿ to reorder rungs. On touch, press and hold to start dragging.</li>
+        <li>Or select a rung/element and click an instruction in the palette to insert it after the selection.</li>
         <li><b>OR branch</b> puts a parallel path around the selection. Shift-click to select several side-by-side elements.</li>
         <li>Outputs only call a service when the coil value <i>changes</i>, so the logbook stays quiet. Tick <b>Enforce</b> to re-apply if someone changes it by hand.</li>
         <li>Operands: ${esc(OPERAND_HELP)}</li>
@@ -1014,7 +1251,7 @@ class LadderPanel extends HTMLElement {
 
   /* ---------- live refresh ---------- */
   _tick(fromMonitor = false) {
-    if (!this._loaded) return;
+    if (!this._loaded || (this._drag && this._drag.active)) return;
     const now = performance.now();
     if (!fromMonitor && now - this._lastTick < 1000) return; // hass updates: at most 1/s
     this._lastTick = now;
@@ -1126,12 +1363,31 @@ main { overflow: auto; padding: 12px 16px 40px; min-width: 0; }
 .rung.rsel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .rung.disabled { opacity: .55; }
 .rhead { display: flex; align-items: center; gap: 6px; padding: 6px 10px; border-bottom: 1px solid var(--line); }
-.rnum { font-weight: 600; min-width: 26px; height: 22px; border-radius: 6px; background: var(--bg); display: inline-flex; align-items: center; justify-content: center; font-size: 12px; }
+.rnum { cursor: grab; touch-action: none; padding: 0 6px; font-weight: 600; min-width: 26px; height: 22px; border-radius: 6px; background: var(--bg); display: inline-flex; align-items: center; justify-content: center; font-size: 12px; }
 .comment { flex: 1; border: 0; background: transparent; color: var(--fg); font: inherit; padding: 4px; min-width: 60px; }
 .comment:focus, .progname:focus { outline: none; border-bottom: 1px solid var(--accent); }
 .rerr { color: var(--err); font-size: 12px; max-width: 30%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.svgwrap { overflow-x: auto; padding: 4px 0; touch-action: pan-x pan-y; }
+.svgwrap { overflow-x: auto; padding: 4px 0; touch-action: none; }
 svg { display: block; user-select: none; }
+.el { cursor: grab; }
+.el.dragging { opacity: .3; }
+:host([dragging]) .el, :host([dragging]) .bushit { cursor: grabbing; }
+:host([dragging]) { user-select: none; -webkit-user-select: none; }
+.pitem { cursor: grab; touch-action: none; }
+.ghost { position: fixed; left: 0; top: 0; z-index: 20; pointer-events: none; padding: 6px 10px; border-radius: 8px;
+  background: var(--accent); color: #fff; font: 600 12px ui-monospace, Menlo, monospace; white-space: pre;
+  box-shadow: 0 6px 18px rgba(0,0,0,.25); }
+.dropind line { stroke: var(--accent); stroke-width: 4; stroke-linecap: round; }
+.dropind circle, .dropind rect { fill: var(--accent); }
+.dropind.box rect { fill: color-mix(in srgb, var(--accent) 15%, transparent); stroke: var(--accent); stroke-width: 2; stroke-dasharray: 5 4; }
+.dropind.box text { fill: var(--accent); font: 700 11px system-ui; }
+.dropind { pointer-events: none; }
+section.rung.rdrop-before { box-shadow: 0 -4px 0 0 var(--accent); }
+section.rung.rdrop-after { box-shadow: 0 4px 0 0 var(--accent); }
+.palette { position: relative; }
+.palette.trash::after { content: "Drop here to delete"; position: absolute; inset: 8px; display: flex; align-items: center; justify-content: center;
+  border: 2px dashed var(--err); border-radius: 10px; color: var(--err); background: color-mix(in srgb, var(--card) 85%, transparent); font-weight: 600; text-align: center; }
+.palette.trashhot::after { background: color-mix(in srgb, var(--err) 18%, var(--card)); }
 .mini { border: 1px solid var(--line); background: var(--card); border-radius: 6px; padding: 3px 8px; font-size: 12px; }
 .mini:hover { border-color: var(--accent); }
 .mini.danger:hover { border-color: var(--err); color: var(--err); }
