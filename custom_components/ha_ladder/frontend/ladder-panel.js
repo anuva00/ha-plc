@@ -4,7 +4,7 @@ const CW = 124;        // cell width
 const CH = 92;         // cell height
 const WY = 50;         // wire y inside a cell
 const RAIL = 14;       // rail inset
-const VERSION = "0.1.2";
+const VERSION = "0.2.0";
 
 const PALETTE = [
   { group: "Bit logic", items: [
@@ -106,6 +106,36 @@ function fieldsFor(type) {
   return FIELDS[type] || [];
 }
 
+/* ---------- entity picker metadata ---------- */
+const DOMAIN_ICON = {
+  light: "💡", switch: "🔌", binary_sensor: "◉", sensor: "📈", input_boolean: "☑", input_number: "🔢", number: "🔢",
+  person: "👤", device_tracker: "📍", cover: "🪟", lock: "🔒", fan: "🌀", climate: "🌡", media_player: "🔊",
+  scene: "🎬", script: "📜", automation: "🤖", button: "🔘", input_button: "🔘", sun: "☀", weather: "⛅",
+  vacuum: "🧹", lawn_mower: "🌱", alarm_control_panel: "🛡", camera: "📷", select: "☰", input_select: "☰",
+  input_text: "✎", text: "✎", timer: "⏲", counter: "#", valve: "🚰", siren: "🚨", humidifier: "💧",
+  update: "⬆", zone: "🗺", schedule: "🗓", event: "⚡", calendar: "📅", water_heater: "♨", remote: "📡",
+};
+const READ_ONLY = new Set(["sensor", "binary_sensor", "person", "device_tracker", "sun", "weather", "zone", "update", "event", "calendar", "camera", "schedule"]);
+const ROLE_PREF = {
+  "bool-in": ["binary_sensor", "input_boolean", "switch", "light", "person", "device_tracker", "cover", "lock", "fan", "media_player", "sun", "alarm_control_panel", "automation", "schedule", "timer", "vacuum", "lawn_mower", "climate"],
+  "bool-out": ["light", "switch", "input_boolean", "fan", "cover", "lock", "scene", "script", "button", "input_button", "siren", "valve", "vacuum", "lawn_mower", "climate", "media_player", "automation", "humidifier", "alarm_control_panel"],
+  "num-in": ["sensor", "input_number", "number", "counter", "climate", "weather", "light", "cover", "media_player"],
+  "num-out": ["input_number", "number", "light", "cover", "fan", "climate", "media_player", "input_text", "input_select", "select", "text"],
+  "any-in": null,
+  "trace": null,
+  "target": null,
+};
+const ROLE_LABEL = { "bool-in": "on/off inputs", "bool-out": "switchable", "num-in": "values", "num-out": "settable", "any-in": "all", "target": "all", "trace": "all" };
+const HIDE_ATTRS = new Set(["friendly_name", "icon", "entity_picture", "supported_features", "supported_color_modes", "attribution", "device_class", "unit_of_measurement", "state_class", "restored", "editable", "id", "user_id", "entity_id", "options", "effect_list", "hs_color", "rgb_color", "xy_color", "color_mode", "min_mireds", "max_mireds", "min_color_temp_kelvin", "max_color_temp_kelvin", "source_list", "sound_mode_list", "fan_modes", "hvac_modes", "preset_modes", "swing_modes", "preset_mode_list"]);
+function roleFor(type, key) {
+  if (key === "entity") return "target";
+  if (key === "dst") return "num-out";
+  if (key === "tag") return COIL_TYPES.has(type) ? "bool-out" : "bool-in";
+  if (["reset", "load", "cd"].includes(key)) return "bool-in";
+  if (type === "CMP") return "any-in";
+  return "num-in";
+}
+
 const uid = () => "x" + Math.random().toString(36).slice(2, 10);
 const clone = (o) => JSON.parse(JSON.stringify(o));
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -171,6 +201,11 @@ class LadderPanel extends HTMLElement {
     this.settings = { scan_ms: 250 };
     this._lastTick = 0;
     this._zones = {};
+    this.view = "ladder";
+    this.tagFilter = "all";
+    this.tagQuery = "";
+    this.trace = { signals: [], data: {}, hist: {}, hidden: {} };
+    this.tview = { span: 300, end: Date.now() / 1000, live: true };
     this._drag = null;
     this._onDragMove = this._onDragMove.bind(this);
     this._onDragEnd = this._onDragEnd.bind(this);
@@ -217,7 +252,15 @@ class LadderPanel extends HTMLElement {
     this._render();
   }
   _subscribe() {
-    this._unsub = this._hass.connection.subscribeMessage((m) => { this.mon = m; this._tick(true); }, { type: "ha_ladder/monitor" });
+    this._unsub = this._hass.connection.subscribeMessage((m) => {
+      this.mon = m;
+      for (const [sig, pts] of Object.entries(m.trace || {})) {
+        const arr = this.trace.data[sig] || (this.trace.data[sig] = []);
+        arr.push(...pts);
+        if (arr.length > 25000) arr.splice(0, arr.length - 20000);
+      }
+      this._tick(true);
+    }, { type: "ha_ladder/monitor" });
     this._unsub.catch(() => {});
   }
 
@@ -405,7 +448,7 @@ class LadderPanel extends HTMLElement {
     const tag = (e.composedPath()[0] || {}).tagName || "";
     const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(tag);
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); this._save(); return; }
-    if (typing) return;
+    if (typing || this.view !== "ladder") return;
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") { e.preventDefault(); this._undo(e.shiftKey); return; }
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") { e.preventDefault(); this._undo(true); return; }
     if (e.key === "Delete" || e.key === "Backspace") { if (this.sel) { e.preventDefault(); this._delete(); } }
@@ -421,6 +464,10 @@ class LadderPanel extends HTMLElement {
         <header>
           <button class="icon menu" id="menu" title="Menu">☰</button>
           <div class="title">Ladder Logic</div>
+          <div class="views" id="views">
+            <button data-view="ladder" class="on">Ladder</button><button data-view="tags">Tags</button><button data-view="trace">Trace</button>
+          </div>
+          <button class="forcepill" id="forcepill" hidden title="Forced tags are active — click to see them">F</button>
           <div class="tabs" id="tabs"></div>
           <span class="dirty" id="dirtynote" hidden>unsaved</span>
           <button class="tb" id="undo" title="Undo (Ctrl+Z)">↶</button>
@@ -433,6 +480,7 @@ class LadderPanel extends HTMLElement {
         <div class="body">
           <aside class="palette" id="palette"></aside>
           <main id="canvas"><div class="loading">Loading…</div></main>
+          <main id="page" hidden></main>
           <aside class="props" id="props"></aside>
         </div>
         <div class="toast" id="toast"></div>
@@ -440,6 +488,15 @@ class LadderPanel extends HTMLElement {
       </div>`;
     const $ = (id) => this.shadowRoot.getElementById(id);
     $("menu").onclick = () => this.dispatchEvent(new Event("hass-toggle-menu", { bubbles: true, composed: true }));
+    $("views").onclick = (e) => { const b = e.target.closest("[data-view]"); if (b) this._setView(b.dataset.view); };
+    $("forcepill").onclick = () => { this.tagFilter = "forced"; this._setView("tags"); };
+    const page = $("page");
+    page.addEventListener("click", (e) => this._pageClick(e));
+    page.addEventListener("input", (e) => this._pageInput(e));
+    page.addEventListener("change", (e) => this._pageInput(e));
+    page.addEventListener("keydown", (e) => { if (e.target.dataset.pick) this._pickKey(e); else if (e.key === "Enter" && e.target.dataset.fval !== undefined) { e.preventDefault(); this._pageClick({ target: e.target.closest("tr").querySelector("[data-tact=force]") }); } });
+    page.addEventListener("focusin", (e) => { if (e.target.dataset.pick) this._pickOpen(e.target); });
+    page.addEventListener("focusout", (e) => { if (e.target.dataset.pick) setTimeout(() => { if (this._pick && this._pick.input === e.target && this.shadowRoot.activeElement !== e.target) this._pickClose(); }, 120); });
     $("undo").onclick = () => this._undo();
     $("redo").onclick = () => this._undo(true);
     $("save").onclick = () => this._save();
@@ -481,6 +538,9 @@ class LadderPanel extends HTMLElement {
     props.addEventListener("input", (e) => this._propInput(e));
     props.addEventListener("change", (e) => this._propInput(e));
     props.addEventListener("click", (e) => this._propClick(e));
+    props.addEventListener("focusin", (e) => { if (e.target.dataset.pick) this._pickOpen(e.target); });
+    props.addEventListener("focusout", (e) => { if (e.target.dataset.pick) setTimeout(() => { if (this._pick && this._pick.input === e.target && this.shadowRoot.activeElement !== e.target) this._pickClose(); }, 120); });
+    props.addEventListener("keydown", (e) => { if (e.target.dataset.pick) this._pickKey(e); });
   }
 
   _render() {
@@ -514,9 +574,13 @@ class LadderPanel extends HTMLElement {
         this._mutate(() => { this.programs.push(this._newProgram(name)); this.pi = this.programs.length - 1; this.sel = null; });
       } else { this.pi = +b.dataset.prog; this.sel = null; this._render(); }
     };
+    $("tabs").style.visibility = this.view === "ladder" ? "" : "hidden";
+    const nf = Object.keys((this.mon && this.mon.forces) || {}).length;
+    $("forcepill").hidden = !nf;
+    $("forcepill").textContent = `F ${nf} forced`;
     const running = !!(this.mon && this.mon.running);
     const run = $("run");
-    run.textContent = running ? "■ STOP" : "▶ RUN";
+    run.innerHTML = running ? "■<span class=\"wide\"> STOP</span>" : "▶<span class=\"wide\"> RUN</span>";
     run.classList.toggle("running", running);
     run.title = running ? "PLC is running — click to stop scanning" : "PLC is stopped — click to start";
     $("online").classList.toggle("on", this.online);
@@ -965,6 +1029,7 @@ class LadderPanel extends HTMLElement {
   _liveVal(tag) {
     const t = String(tag || "").trim();
     if (!t) return "";
+    if (this.mon && this.mon.forces && t in this.mon.forces) return fmtVal(this.mon.forces[t]) + " (F)";
     if (t.startsWith("#")) {
       const n = t.slice(1), mon = this.mon || {};
       const m = /^(.*)\.(Q|ET|CV)$/i.exec(n);
@@ -1002,7 +1067,7 @@ class LadderPanel extends HTMLElement {
       o.push(`<text class="lbl ${L.warn ? "warn" : ""}" x="${cx}" y="${yy - yOff}" text-anchor="middle">${esc(trunc(L.main, 19))}</text>`);
       if (L.sub) o.push(`<text class="tag" x="${cx}" y="${yy - yOff + 11}" text-anchor="middle">${esc(trunc(L.sub, 20))}</text>`);
     };
-    const valueText = (s) => { if (s !== "" && s !== undefined && s !== null) o.push(`<text class="val" x="${cx}" y="${yy + 34}" text-anchor="middle">${esc(trunc(s, 20))}</text>`); };
+    const valueText = (s) => { if (s !== "" && s !== undefined && s !== null) o.push(`<text class="val ${/\(F\)$/.test(s) ? "fval" : ""}" x="${cx}" y="${yy + 34}" text-anchor="middle">${esc(trunc(s, 20))}</text>`); };
 
     if (CONTACT_TYPES.has(t)) {
       const v = md ? md[2] : undefined;
@@ -1013,6 +1078,7 @@ class LadderPanel extends HTMLElement {
       o.push(`<line class="sym" x1="${cx - 10}" y1="${yy - 15}" x2="${cx - 10}" y2="${yy + 15}"/><line class="sym" x1="${cx + 10}" y1="${yy - 15}" x2="${cx + 10}" y2="${yy + 15}"/>`);
       if (t === "NC") o.push(`<line class="sym thin" x1="${cx - 7}" y1="${yy + 12}" x2="${cx + 7}" y2="${yy - 12}"/>`);
       if (t === "P" || t === "N") o.push(`<text class="symt" x="${cx}" y="${yy + 5}" text-anchor="middle">${t}</text>`);
+      if (this._forced(el.tag)) o.push(`<rect class="fbadge" x="${cx - 30}" y="${yy - 22}" width="13" height="13" rx="3"/><text class="fbadget" x="${cx - 23.5}" y="${yy - 12}" text-anchor="middle">F</text>`);
       label(el.tag);
       valueText(this._liveVal(el.tag));
     } else if (COIL_TYPES.has(t)) {
@@ -1025,6 +1091,7 @@ class LadderPanel extends HTMLElement {
       if (inner === "/") o.push(`<line class="sym thin" x1="${cx - 5}" y1="${yy + 10}" x2="${cx + 5}" y2="${yy - 10}"/>`);
       else if (inner) o.push(`<text class="symt" x="${cx}" y="${yy + 5}" text-anchor="middle">${inner}</text>`);
       if (el.enforce) o.push(`<text class="badge" x="${cx + 20}" y="${yy - 14}">E</text>`);
+      if (this._forced(el.tag)) o.push(`<rect class="fbadge" x="${cx - 32}" y="${yy - 22}" width="13" height="13" rx="3"/><text class="fbadget" x="${cx - 25.5}" y="${yy - 12}" text-anchor="middle">F</text>`);
       label(el.tag);
       valueText(this._liveVal(el.tag));
     } else if (t === "NOT" || t === "PTRIG" || t === "NTRIG") {
@@ -1079,6 +1146,7 @@ class LadderPanel extends HTMLElement {
 
   /* ---------- properties / watch panel ---------- */
   _renderProps() {
+    this._pickClose();
     const p = this.shadowRoot.getElementById("props");
     const sel = this.sel;
     this.toggleAttribute("sheet", !!(sel && sel.ids.length));
@@ -1100,12 +1168,16 @@ class LadderPanel extends HTMLElement {
   }
   _elementForm(el, loc) {
     const fields = fieldsFor(el.type);
-    const ents = this._datalist();
     const rows = fields.map(([key, label, kind, extra]) => {
       const v = el[key];
       let input;
-      if (kind === "operand") input = `<input data-field="${key}" list="ld-ents" value="${esc(v ?? "")}" spellcheck="false" autocomplete="off"><div class="live" data-live="${esc(key)}">${esc(this._operandHint(v))}</div>`;
-      else if (kind === "service") input = `<input data-field="${key}" list="ld-svcs" value="${esc(v ?? "")}" spellcheck="false" autocomplete="off">`;
+      if (kind === "operand" || kind === "service") {
+        const role = kind === "service" ? (el.type === "NOTIFY" ? "notify" : "service") : roleFor(el.type, key);
+        const help = typeof extra === "string" ? `<div class="help">${esc(extra)}</div>` : "";
+        return `<div class="field picker-field"><span>${esc(label)}</span>
+          <div class="pickwrap"><input data-field="${key}" data-pick="${role}" value="${esc(v ?? "")}" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="${kind === "service" ? "Search actions…" : "Search entities, or #marker, or a value…"}"><button class="pickbtn" data-pickopen="${key}" tabindex="-1" title="Browse">▾</button></div>
+          ${kind === "operand" ? `<div class="live" data-live="${esc(key)}">${this._operandChip(v)}</div>` : ""}${help}</div>`;
+      }
       else if (kind === "text") input = `<input data-field="${key}" value="${esc(v ?? "")}" spellcheck="false">`;
       else if (kind === "time") input = `<input type="time" data-field="${key}" value="${esc(v ?? "")}">`;
       else if (kind === "textarea") input = `<textarea data-field="${key}" rows="3" spellcheck="false">${esc(v ?? "")}</textarea>`;
@@ -1117,7 +1189,7 @@ class LadderPanel extends HTMLElement {
     }).join("");
     const err = this.mon && this.mon.e && this.mon.e[el.id];
     const inOut = loc.where === "outputs" ? "output" : "logic";
-    return `${ents}
+    return `<div data-elid="${el.id}">
       <div class="phead"><b>${esc(el.type)}</b> <span class="muted">${esc(DESCR[el.type] || "")}</span><button class="mini" data-pact="close">✕</button></div>
       ${err ? `<div class="errbox">⚠ ${esc(err)}</div>` : ""}
       ${rows || `<p class="muted">No settings.</p>`}
@@ -1127,26 +1199,246 @@ class LadderPanel extends HTMLElement {
         ${inOut === "logic" ? `<button class="mini" data-pact="or" title="Add a parallel branch around this">OR branch</button>` : ""}
         <button class="mini danger" data-pact="del" title="Delete">Delete</button>
       </div>
-      <p class="help">Operands: ${esc(OPERAND_HELP)}</p>`;
+      <p class="help">Operands: ${esc(OPERAND_HELP)}</p></div>`;
   }
-  _datalist() {
+  /* ---------- entity / action picker ---------- */
+  _entityIndex() {
+    // rebuilt when the entity count changes
     const st = this._hass.states;
-    const ents = Object.keys(st).sort();
-    const tags = new Set();
+    const n = Object.keys(st).length;
+    if (this._eidx && this._eidx.n === n && this._eidx.st === st) return this._eidx.list;
+    const reg = this._hass.entities || {}, devs = this._hass.devices || {}, areas = this._hass.areas || {};
+    const list = Object.keys(st).map((eid) => {
+      const s = st[eid], r = reg[eid] || {};
+      const dev = r.device_id ? devs[r.device_id] : null;
+      const areaId = r.area_id || (dev && dev.area_id);
+      const name = s.attributes.friendly_name || eid;
+      const area = areaId && areas[areaId] ? areas[areaId].name : "";
+      const device = dev ? dev.name_by_user || dev.name || "" : "";
+      return { eid, domain: eid.split(".")[0], name, area, device, minor: !!(r.hidden || r.entity_category),
+        hay: `${name} ${eid} ${area} ${device}`.toLowerCase() };
+    });
+    this._eidx = { n, st, list };
+    return list;
+  }
+  _programTags(skipId = null) {
+    const tags = new Set(), ents = new Set();
     for (const p of this.programs) for (const r of p.rungs) {
       const scan = (n) => {
-        for (const k of ["tag", "a", "b", "dst", "src", "reset", "load", "cd"]) if (typeof n[k] === "string" && n[k].startsWith("#")) tags.add(n[k]);
+        if (n.id === skipId) return;
+        for (const k of ["tag", "a", "b", "dst", "src", "reset", "load", "cd", "entity", "pt", "pv", "min", "max"]) {
+          const v = typeof n[k] === "string" ? n[k].trim() : "";
+          if (v.startsWith("#")) tags.add(v);
+          else if (/^[a-z_0-9]+\.[a-z0-9_]+/.test(v)) ents.add(v.replace(/\[.*$/, ""));
+        }
         if (n.name && TIMER_TYPES.has(n.type)) { tags.add(`#${n.name}.Q`); tags.add(`#${n.name}.ET`); }
         if (n.name && COUNTER_TYPES.has(n.type)) { tags.add(`#${n.name}.Q`); tags.add(`#${n.name}.CV`); }
       };
       walk(r.logic, (n) => n.t === "el" && scan(n));
       r.outputs.forEach(scan);
     }
-    const svcs = [];
-    const services = this._hass.services || {};
-    for (const d of Object.keys(services).sort()) for (const s of Object.keys(services[d]).sort()) svcs.push(`${d}.${s}`);
-    return `<datalist id="ld-ents">${[...tags].sort().map((t) => `<option value="${esc(t)}">`).join("")}${ents.map((e) => `<option value="${esc(e)}">${esc(st[e].attributes.friendly_name || "")}</option>`).join("")}</datalist>
-      <datalist id="ld-svcs">${svcs.map((s) => `<option value="${esc(s)}">`).join("")}</datalist>`;
+    for (const k of Object.keys((this.mon && this.mon.mem) || {})) tags.add("#" + k);
+    return { tags: [...tags].sort(), ents };
+  }
+  _recents() { try { return JSON.parse(localStorage.getItem("ha_ladder_recent") || "[]"); } catch (e) { return []; } }
+  _pushRecent(v) {
+    try {
+      const r = this._recents().filter((x) => x !== v); r.unshift(v);
+      localStorage.setItem("ha_ladder_recent", JSON.stringify(r.slice(0, 12)));
+    } catch (e) { /* storage unavailable */ }
+  }
+  _pickOpen(input, all = false) {
+    if (this._pick && this._pick.input === input) return;
+    this._pickClose();
+    const pop = document.createElement("div");
+    pop.className = "pickpop";
+    pop.addEventListener("pointerdown", (e) => { if (!e.target.closest("input")) e.preventDefault(); }); // keep focus in the input
+    pop.addEventListener("click", (e) => this._pickClick(e));
+    input.closest(".pickwrap").after(pop);
+    this._pick = { input, pop, role: input.dataset.pick, filter: "suggested", hi: 0, items: [], showAll: true };
+    this._pickFilter(input, true);
+    // highlight the current value if it's in the list
+    const cur = input.value.trim(), i = this._pick.items.findIndex((it) => it.v === cur);
+    if (i >= 0) { this._pick.hi = i; this._pickRender(); }
+  }
+  _pickClose() {
+    if (!this._pick) return;
+    this._pick.pop.remove();
+    this._pick = null;
+  }
+  _pickFilter(input, ignoreQuery = false) {
+    const P = this._pick; if (!P || P.input !== input) { this._pickOpen(input); return; }
+    const raw = input.value;
+    // for comma-separated targets, search the last segment
+    const q = (P.role === "target" ? raw.split(",").pop() : raw).trim().toLowerCase();
+    const query = ignoreQuery || P.showAll ? "" : q;
+    P.showAll = false;
+    const items = [];
+    const sec = (title) => items.push({ sec: title });
+    if (P.role === "service" || P.role === "notify") {
+      const sv = this._hass.services || {};
+      const all = [];
+      for (const d of Object.keys(sv)) for (const s of Object.keys(sv[d])) {
+        const id = `${d}.${s}`, meta = sv[d][s] || {};
+        const name = meta.name || s.replace(/_/g, " ");
+        const hay = `${id} ${name} ${meta.description || ""}`.toLowerCase();
+        if (P.role === "notify" && d !== "notify") continue;
+        const sc = this._score(hay, id, name, query);
+        if (sc >= 0) all.push({ v: id, name, sub: id, desc: meta.description || "", icon: DOMAIN_ICON[d] || "⚙", sc });
+      }
+      all.sort((a, b) => b.sc - a.sc || a.v.localeCompare(b.v));
+      if (all.length) sec(query ? "Actions" : "All actions");
+      items.push(...all.slice(0, 80));
+    } else {
+      const host = input.closest("[data-elid]");
+      const { tags, ents: used } = this._programTags(host ? host.dataset.elid : null);
+      const pref = ROLE_PREF[P.role] ? new Set(ROLE_PREF[P.role]) : null;
+      const writable = P.role === "bool-out" || P.role === "num-out" || P.role === "target";
+      // markers / timers / counters
+      const mq = query.replace(/^#/, "");
+      const mt = tags.filter((t) => !mq || t.toLowerCase().includes(mq)).filter((t) => !(writable && /\.(Q|ET|CV)$/i.test(t) && P.role !== "target"));
+      // entities
+      const idx = this._entityIndex();
+      const recent = this._recents();
+      let pool = idx.filter((x) => !(writable && READ_ONLY.has(x.domain)));
+      const counts = {};
+      pool.forEach((x) => { if (!query || this._score(x.hay, x.eid, x.name, query) >= 0) counts[x.domain] = (counts[x.domain] || 0) + 1; });
+      if (P.filter === "suggested" && pref) pool = pool.filter((x) => pref.has(x.domain));
+      else if (P.filter !== "suggested" && P.filter !== "all") pool = pool.filter((x) => x.domain === P.filter);
+      const scored = [];
+      for (const x of pool) {
+        let sc = this._score(x.hay, x.eid, x.name, query);
+        if (sc < 0) continue;
+        const ri = recent.indexOf(x.eid);
+        if (ri >= 0) sc += 300 - ri * 10;
+        if (used.has(x.eid)) sc += 150;
+        if (x.minor) sc -= 200;
+        if (!query && ri < 0 && !used.has(x.eid)) sc = -1000 - (x.minor ? 1 : 0); // alphabetical below
+        scored.push({ x, sc, recent: ri >= 0, used: used.has(x.eid) });
+      }
+      scored.sort((a, b) => b.sc - a.sc || (a.x.area || "~").localeCompare(b.x.area || "~") || a.x.name.localeCompare(b.x.name));
+      // header chips
+      P.chips = [["suggested", pref ? `Suggested · ${ROLE_LABEL[P.role]}` : "All"], ...(pref ? [["all", "All"]] : [])]
+        .concat(Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([d, n]) => [d, `${DOMAIN_ICON[d] || ""} ${d} ${n}`]));
+      const num = q !== "" && !isNaN(+q);
+      if (num) { sec("Use as"); items.push({ v: q, name: `Number ${q}`, sub: "constant", icon: "#" }); }
+      else if (q && !/^[a-z_0-9]+\.[a-z0-9_]+(\[.*\])?$/.test(q) && !query.startsWith("#") && !scored.length) {
+        sec("Use as");
+        {
+          items.push({ v: `'${raw.trim()}'`, name: `Text '${raw.trim()}'`, sub: "constant (e.g. compare with a state)", icon: "❝" });
+          items.push({ v: "#" + q.replace(/[^a-z0-9_.]+/g, "_"), name: `New marker #${q.replace(/[^a-z0-9_.]+/g, "_")}`, sub: "internal memory bit/value", icon: "M" });
+        }
+      }
+      if (mt.length && (query.startsWith("#") || !query || mt.length < 12)) {
+        sec("Markers, timers & counters");
+        mt.slice(0, 30).forEach((t) => items.push({ v: t, name: t, sub: this._liveVal(t) ? "= " + this._liveVal(t) : "", icon: /\.(Q|ET)$/i.test(t) ? "⏲" : /\.CV$/i.test(t) ? "#" : "M", mono: true }));
+      }
+      if (query.startsWith("#") && mq && !tags.includes("#" + mq)) {
+        sec("New");
+        items.push({ v: "#" + mq.replace(/[^a-z0-9_.]+/gi, "_"), name: `Create marker #${mq.replace(/[^a-z0-9_.]+/gi, "_")}`, sub: "internal memory", icon: "＋" });
+      }
+      let lastSec = null;
+      for (const { x, recent: rc, used: us, sc } of scored.slice(0, 120)) {
+        const s = !query ? (rc ? "Recently used" : us ? "In this program" : "Entities") : "Entities";
+        if (s !== lastSec) { sec(s); lastSec = s; }
+        items.push({ v: x.eid, name: x.name, sub: x.eid, area: x.area || x.device, icon: DOMAIN_ICON[x.domain] || "•", state: this._liveVal(x.eid), eid: x.eid, dim: x.minor });
+      }
+      if (scored.length > 120) items.push({ more: scored.length - 120 });
+    }
+    P.items = items;
+    P.hi = items.findIndex((i) => i.v !== undefined);
+    this._pickRender();
+  }
+  _score(hay, id, name, q) {
+    if (!q) return 0;
+    const toks = q.split(/\s+/).filter(Boolean);
+    for (const t of toks) if (!hay.includes(t)) return -1;
+    let s = 0;
+    const nl = name.toLowerCase();
+    if (id === q) s += 1000;
+    if (id.startsWith(q) || id.split(".")[1]?.startsWith(q)) s += 300;
+    if (nl.startsWith(q)) s += 260;
+    for (const t of toks) { if (new RegExp("(^|[\\s._-])" + t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).test(hay)) s += 60; }
+    return s - Math.min(40, nl.length / 3);
+  }
+  _pickRender() {
+    const P = this._pick; if (!P) return;
+    const chips = P.role === "service" || P.role === "notify" ? "" : `<div class="pchips">${(P.chips || []).map(([k, l]) => `<button class="pchip ${P.filter === k ? "on" : ""}" data-pfilter="${esc(k)}">${esc(l)}</button>`).join("")}</div>`;
+    const rows = P.items.map((it, i) => {
+      if (it.sec) return `<div class="psec">${esc(it.sec)}</div>`;
+      if (it.more) return `<div class="pmore">${it.more} more — keep typing to narrow down</div>`;
+      return `<div class="popt ${i === P.hi ? "hi" : ""} ${it.dim ? "dim" : ""}" data-pi="${i}">
+        <span class="picon">${esc(it.icon || "")}</span>
+        <span class="pmain"><span class="pname ${it.mono ? "mono" : ""}">${esc(it.name)}</span><span class="psub">${esc(it.sub || "")}${it.area ? ` · ${esc(it.area)}` : ""}</span>${it.desc ? `<span class="pdesc">${esc(trunc(it.desc, 90))}</span>` : ""}</span>
+        ${it.state ? `<span class="pstate">${esc(trunc(it.state, 16))}</span>` : ""}</div>`;
+    }).join("");
+    P.pop.innerHTML = chips + `<div class="plist">${rows || `<div class="pmore">No matches</div>`}</div>`;
+    const hi = P.pop.querySelector(".popt.hi");
+    if (hi) hi.scrollIntoView({ block: "nearest" });
+  }
+  _pickClick(e) {
+    const P = this._pick; if (!P) return;
+    const f = e.target.closest("[data-pfilter]");
+    if (f) { P.filter = f.dataset.pfilter; P.input.focus(); this._pickFilter(P.input); return; }
+    const o = e.target.closest("[data-pi]");
+    if (o) this._pickChoose(+o.dataset.pi);
+    const a = e.target.closest("[data-pattr]");
+    if (a) this._pickSet(a.dataset.pattr, true);
+  }
+  _pickChoose(i) {
+    const P = this._pick; const it = P && P.items[i]; if (!it || it.v === undefined) return;
+    let v = it.v;
+    if (P.role === "target") { const parts = P.input.value.split(","); parts[parts.length - 1] = (parts.length > 1 ? " " : "") + v; v = parts.join(","); }
+    this._pickSet(v, !it.eid || P.role === "target" || P.role === "trace");
+    if (it.eid) this._pushRecent(it.eid);
+    if (it.eid && P.role !== "target" && P.role !== "trace") this._pickAttrs(it.eid);
+  }
+  _pickSet(v, close) {
+    const P = this._pick; if (!P || !P.input.isConnected) { this._pickClose(); return; }
+    P.input.value = v;
+    P.input.dispatchEvent(new CustomEvent("input", { bubbles: true, detail: { fromPicker: true } }));
+    if (close) { this._pickClose(); }
+  }
+  _pickAttrs(eid) {
+    // after picking an entity, offer its attributes (e.g. brightness, temperature)
+    const P = this._pick; const st = this._hass.states[eid]; if (!P || !st) return;
+    const attrs = Object.entries(st.attributes).filter(([k, v]) => !HIDE_ATTRS.has(k) && (typeof v === "number" || typeof v === "string" || typeof v === "boolean")).slice(0, 14);
+    if (!attrs.length) { this._pickClose(); return; }
+    P.items = [];
+    P.pop.innerHTML = `<div class="psec">Use ${esc(st.attributes.friendly_name || eid)} as…</div>
+      <div class="pattrs"><button class="pattr on" data-pattr="${esc(eid)}"><b>state</b><span>${esc(trunc(this._liveVal(eid), 14))}</span></button>
+      ${attrs.map(([k, v]) => `<button class="pattr" data-pattr="${esc(eid)}[${esc(k)}]"><b>${esc(k)}</b><span>${esc(trunc(fmtVal(v), 14))}</span></button>`).join("")}</div>
+      <div class="pmore">Enter or click elsewhere keeps the state</div>`;
+    P.attrMode = true;
+  }
+  _pickKey(e) {
+    const P = this._pick;
+    if (!P) { if (e.key === "ArrowDown") { this._pickOpen(e.target, true); e.preventDefault(); } return; }
+    if (P.attrMode) { if (e.key === "Enter" || e.key === "Escape" || e.key === "Tab") { this._pickClose(); if (e.key !== "Tab") e.preventDefault(); } else this._pick.attrMode = false; return; }
+    const sel = P.items.map((it, i) => (it.v !== undefined ? i : -1)).filter((i) => i >= 0);
+    const pos = sel.indexOf(P.hi);
+    if (e.key === "ArrowDown") { P.hi = sel[Math.min(sel.length - 1, pos + 1)] ?? P.hi; this._pickRender(); e.preventDefault(); }
+    else if (e.key === "ArrowUp") { P.hi = sel[Math.max(0, pos - 1)] ?? P.hi; this._pickRender(); e.preventDefault(); }
+    else if (e.key === "Enter") { if (P.hi >= 0) this._pickChoose(P.hi); else this._pickClose(); e.preventDefault(); }
+    else if (e.key === "Escape") { this._pickClose(); e.preventDefault(); e.stopPropagation(); }
+    else if (e.key === "Tab") this._pickClose();
+  }
+  _operandChip(v) {
+    const s = String(v ?? "").trim();
+    if (!s) return "";
+    const base = s.replace(/\[.*$/, "");
+    const st = this._hass.states[base];
+    const attr = (/\[(.+)\]$/.exec(s) || [])[1];
+    if (/^[a-z_0-9]+\.[a-z0-9_]+(\[.*\])?$/.test(s)) {
+      if (!st) return `<span class="chip warn">⚠ entity not found</span>`;
+      const reg = (this._hass.entities || {})[base] || {};
+      const dev = reg.device_id && this._hass.devices ? this._hass.devices[reg.device_id] : null;
+      const aid = reg.area_id || (dev && dev.area_id);
+      const area = aid && this._hass.areas && this._hass.areas[aid] ? this._hass.areas[aid].name : "";
+      return `<span class="chip"><span>${DOMAIN_ICON[base.split(".")[0]] || "•"}</span><b>${esc(st.attributes.friendly_name || base)}</b>${attr ? `<i>${esc(attr)}</i>` : ""}${area ? `<span class="muted">${esc(area)}</span>` : ""}<span class="cval">${esc(this._liveVal(s))}</span></span>`;
+    }
+    if (s.startsWith("#")) { const lv = this._liveVal(s); return `<span class="chip"><span>M</span><b class="mono">${esc(s)}</b><span class="cval">${esc(lv === "—" ? "new" : lv)}</span></span>`; }
+    return `<span class="chip"><span>❝</span>constant <b class="mono">${esc(s)}</b></span>`;
   }
   _operandHint(v) {
     const s = String(v ?? "").trim();
@@ -1159,8 +1451,9 @@ class LadderPanel extends HTMLElement {
   }
   _propInput(e) {
     const t = e.target;
-    const sel = this.sel; if (!sel || sel.ids.length !== 1) return;
-    const loc = this._locate(sel.ids[0]); if (!loc || loc.node.t !== "el") return;
+    // edits belong to the element the form was built for, even if the selection has moved on
+    const host = t.closest("[data-elid]"); if (!host) return;
+    const loc = this._locate(host.dataset.elid); if (!loc || loc.node.t !== "el") return;
     const el = loc.node;
     if (t.dataset.day !== undefined) {
       if (e.type !== "change") return;
@@ -1173,7 +1466,8 @@ class LadderPanel extends HTMLElement {
       if (t.type === "checkbox") { if (e.type !== "change") return; el[key] = t.checked; }
       else el[key] = t.value;
       const live = this.shadowRoot.querySelector(`[data-live="${key}"]`);
-      if (live) live.textContent = this._operandHint(t.value);
+      if (live) live.innerHTML = this._operandChip(t.value);
+      if (t.dataset.pick && e.type === "input" && !e.detail?.fromPicker) this._pickFilter(t);
     } else return;
     this._commitSnap();
     this._setDirty(true);
@@ -1181,6 +1475,8 @@ class LadderPanel extends HTMLElement {
     this._updateSvgs();
   }
   _propClick(e) {
+    const po = e.target.closest("[data-pickopen]");
+    if (po) { const inp = this.shadowRoot.querySelector(`#props [data-field="${po.dataset.pickopen}"]`); if (inp) { if (this._pick && this._pick.input === inp) this._pickClose(); else { inp.focus(); this._pickOpen(inp, true); } } return; }
     const b = e.target.closest("[data-pact]");
     if (b) {
       switch (b.dataset.pact) {
@@ -1249,6 +1545,563 @@ class LadderPanel extends HTMLElement {
     });
   }
 
+  /* ---------- views ---------- */
+  _setView(v) {
+    this.view = v;
+    this.setAttribute("view", v);
+    this._pickClose();
+    const $ = (id) => this.shadowRoot.getElementById(id);
+    this.shadowRoot.querySelectorAll("#views [data-view]").forEach((b) => b.classList.toggle("on", b.dataset.view === v));
+    $("canvas").hidden = v !== "ladder";
+    $("page").hidden = v === "ladder";
+    if (v === "tags") this._renderTags();
+    else if (v === "trace") this._renderTrace();
+    else this._render();
+    this._renderToolbar();
+  }
+  _forced(tag) {
+    const k = String(tag ?? "").trim();
+    return !!(k && this.mon && this.mon.forces && k in this.mon.forces);
+  }
+  _pageClick(e) {
+    if (this.view === "tags") return this._tagsClick(e);
+    if (this.view === "trace") return this._traceClick(e);
+  }
+  _pageInput(e) {
+    const t = e.target;
+    if (t.dataset.pick && e.type === "input" && !(e.detail && e.detail.fromPicker)) { this._pickFilter(t); return; }
+    if (this.view === "tags" && t.id === "tagq") { this.tagQuery = t.value; this._tagsBody(); return; }
+    if (this.view === "tags" && t.dataset.pick && e.detail && e.detail.fromPicker) {
+      const v = t.value.trim(); t.value = "";
+      if (v) { const w = this._watchList(); if (!w.includes(v)) { w.push(v); this._saveWatch(w); } this._tagsBody(); }
+      return;
+    }
+    if (this.view === "trace" && t.dataset.pick && e.detail && e.detail.fromPicker) {
+      const v = t.value.trim(); t.value = "";
+      if (v) this._traceAdd(v);
+    }
+  }
+
+  /* ---------- tags / force table ---------- */
+  _watchList() { try { return JSON.parse(localStorage.getItem("ha_ladder_watch") || "[]"); } catch (e) { return []; } }
+  _saveWatch(w) { try { localStorage.setItem("ha_ladder_watch", JSON.stringify(w)); } catch (e) { /* ignore */ } }
+  _collectTags() {
+    // tag -> {tag, kind, uses:[{pi, rung, id, label}]}
+    const map = new Map();
+    const add = (tag, kind, use) => {
+      tag = String(tag ?? "").trim();
+      if (!tag) return;
+      const op = /^#/.test(tag) ? "mem" : /^[a-z_0-9]+\.[a-z0-9_]+(\[.+\])?$/.test(tag) ? "ent" : null;
+      if (!op) return;
+      let t = map.get(tag);
+      if (!t) map.set(tag, (t = { tag, kinds: new Set(), uses: [] }));
+      if (kind) t.kinds.add(kind);
+      if (use) t.uses.push(use);
+    };
+    const OUTK = { tag: 1, dst: 1 };
+    this.programs.forEach((p, pi) => p.rungs.forEach((r, ri) => {
+      const scan = (n) => {
+        const use = { pi, rung: r.id, id: n.id, label: `${this.programs.length > 1 ? p.name + " · " : ""}R${ri + 1} ${n.type}` };
+        for (const k of ["tag", "a", "b", "src", "dst", "reset", "load", "cd", "pt", "pv", "min", "max", "in_min", "in_max", "out_min", "out_max"]) {
+          const v = n[k]; if (typeof v !== "string" || !v.trim()) continue;
+          const isOut = (k === "tag" && COIL_TYPES.has(n.type)) || k === "dst";
+          const tag = v.trim();
+          const kind = tag.startsWith("#") ? (/\.(Q|ET)$/i.test(tag) ? "timer" : /\.CV$/i.test(tag) ? "counter" : "marker") : isOut ? "output" : "input";
+          add(tag, kind, use);
+        }
+        if (n.name && TIMER_TYPES.has(n.type)) { add(`#${n.name}.Q`, "timer", use); add(`#${n.name}.ET`, "timer", use); }
+        if (n.name && COUNTER_TYPES.has(n.type)) { add(`#${n.name}.CV`, "counter", use); add(`#${n.name}.Q`, "counter", use); }
+      };
+      walk(r.logic, (n) => n.t === "el" && scan(n));
+      r.outputs.forEach(scan);
+    }));
+    const mon = this.mon || {};
+    for (const k of Object.keys(mon.mem || {})) add("#" + k, "marker");
+    for (const k of Object.keys(mon.forces || {})) add(k, k.startsWith("#") ? "marker" : "input");
+    for (const w of this._watchList()) add(w, w.startsWith("#") ? "marker" : "watch");
+    return [...map.values()].map((t) => {
+      const kinds = t.kinds;
+      let kind = kinds.has("timer") ? "timer" : kinds.has("counter") ? "counter" : kinds.has("marker") ? "marker"
+        : kinds.has("output") && kinds.has("input") ? "in/out" : kinds.has("output") ? "output" : kinds.has("input") ? "input" : "watch";
+      return { ...t, kind };
+    }).sort((a, b) => a.tag.localeCompare(b.tag));
+  }
+  _rawValue(tag) {
+    // typed value for a tag: bool / number / string / null
+    const mon = this.mon || {};
+    if (mon.forces && tag in mon.forces) return mon.forces[tag];
+    if (tag.startsWith("#")) {
+      const n = tag.slice(1), m = /^(.*)\.(Q|ET|CV)$/i.exec(n);
+      if (m) {
+        const f = m[2].toUpperCase();
+        if (mon.tmr && mon.tmr[m[1]]) return f === "Q" ? mon.tmr[m[1]].q : mon.tmr[m[1]].et;
+        if (mon.ctr && mon.ctr[m[1]]) return f === "Q" ? !!mon.ctr[m[1]].q : mon.ctr[m[1]].cv;
+      }
+      return mon.mem ? mon.mem[n] : undefined;
+    }
+    const am = /^([a-z_0-9]+\.[a-z0-9_]+)\[(.+)\]$/.exec(tag);
+    const st = this._hass.states[am ? am[1] : tag];
+    if (!st) return undefined;
+    if (am) return st.attributes[am[2]];
+    const n = Number(st.state);
+    return st.state !== "" && !isNaN(n) ? n : st.state;
+  }
+  _typeOf(tag, v) {
+    if (typeof v === "boolean" || /\.Q$/i.test(tag)) return "BOOL";
+    if (typeof v === "number" || /\.(ET|CV)$/i.test(tag)) return "NUM";
+    if (typeof v === "string") {
+      const d = tag.split(".")[0];
+      if (["binary_sensor", "input_boolean", "switch", "light", "fan", "lock", "cover", "person", "device_tracker", "automation", "siren"].includes(d) && !tag.includes("[")) return "BOOL";
+      return "TEXT";
+    }
+    return "—";
+  }
+  _renderTags() {
+    const page = this.shadowRoot.getElementById("page");
+    const chips = [["all", "All"], ["marker", "Markers"], ["timer", "Timers"], ["counter", "Counters"], ["input", "Inputs"], ["output", "Outputs"], ["watch", "Watched"], ["forced", "Forced"]];
+    page.innerHTML = `
+      <div class="pagehead">
+        <h2>Tags</h2>
+        <input id="tagq" class="search" placeholder="Filter tags…" value="${esc(this.tagQuery)}">
+        <div class="chiprow">${chips.map(([k, l]) => `<button class="pchip ${this.tagFilter === k ? "on" : ""}" data-tfilter="${k}">${l}</button>`).join("")}</div>
+        <div class="spacer"></div>
+        <div class="pickwrap addwatch"><input data-pick="any-in" placeholder="＋ Watch an entity or marker…" autocomplete="off" spellcheck="false"></div>
+        <button class="mini danger" data-tact="unforceall" id="unforceall">Release all forces</button>
+      </div>
+      <p class="muted small">Modify writes a value once. <b>Force</b> holds the tag at a value until released — the program can't change it and forced outputs are driven to it. Forces survive restarts, like a PLC force table.</p>
+      <div class="tablewrap"><table class="tags">
+        <thead><tr><th></th><th>Tag</th><th>Type</th><th>Kind</th><th class="r">Value</th><th>Modify</th><th>Force</th><th>Used in</th><th></th></tr></thead>
+        <tbody id="tagbody"></tbody>
+      </table></div>`;
+    this._tagsBody();
+  }
+  _tagsBody() {
+    const body = this.shadowRoot.getElementById("tagbody"); if (!body) return;
+    const forces = (this.mon && this.mon.forces) || {};
+    const q = this.tagQuery.trim().toLowerCase();
+    const all = this._collectTags();
+    const rows = all.filter((t) => {
+      const f = this.tagFilter;
+      if (f === "forced" && !(t.tag in forces)) return false;
+      if (f === "input" && !["input", "in/out"].includes(t.kind)) return false;
+      if (f === "output" && !["output", "in/out"].includes(t.kind)) return false;
+      if (!["all", "forced", "input", "output"].includes(f) && t.kind !== f) return false;
+      if (q) { const st = this._hass.states[t.tag.replace(/\[.*$/, "")]; const hay = (t.tag + " " + (st ? st.attributes.friendly_name || "" : "")).toLowerCase(); if (!q.split(/\s+/).every((w) => hay.includes(w))) return false; }
+      return true;
+    });
+    const ub = this.shadowRoot.getElementById("unforceall"); if (ub) ub.hidden = !Object.keys(forces).length;
+    if (!rows.length) { body.innerHTML = `<tr><td colspan="9" class="muted empty">No tags${this.tagFilter !== "all" || q ? " match" : " yet — tags appear as you use them in rungs"}.</td></tr>`; return; }
+    body.innerHTML = rows.map((t) => {
+      const v = this._rawValue(t.tag), type = this._typeOf(t.tag, v), forced = t.tag in forces;
+      const base = t.tag.replace(/\[.*$/, ""), st = this._hass.states[base];
+      const name = t.tag.startsWith("#") ? "" : st ? st.attributes.friendly_name || "" : "⚠ not found";
+      const canModify = t.tag.startsWith("#") && !/\.(Q|ET)$/i.test(t.tag) && !(/\.Q$/i.test(t.tag));
+      const tracing = this.trace.signals.includes(t.tag);
+      const modify = !canModify ? `<span class="muted">—</span>`
+        : type === "BOOL" ? `<button class="mini" data-tact="toggle" data-tag="${esc(t.tag)}">Toggle</button>`
+        : `<input class="num tagin" data-mval value="" placeholder="${esc(fmtVal(v))}"><button class="mini" data-tact="write" data-tag="${esc(t.tag)}">Write</button>`;
+      const force = type === "BOOL"
+        ? `<button class="mini ${forced && forces[t.tag] === true ? "fon" : ""}" data-tact="f1" data-tag="${esc(t.tag)}">Force 1</button><button class="mini ${forced && forces[t.tag] === false ? "fon" : ""}" data-tact="f0" data-tag="${esc(t.tag)}">Force 0</button>`
+        : `<input class="num tagin" data-fval value="${forced ? esc(fmtVal(forces[t.tag])) : ""}" placeholder="value"><button class="mini ${forced ? "fon" : ""}" data-tact="force" data-tag="${esc(t.tag)}">Force</button>`;
+      return `<tr class="${forced ? "forced" : ""}" data-row="${esc(t.tag)}">
+        <td>${forced ? `<span class="fmark" title="Forced">F</span>` : ""}</td>
+        <td><div class="mono tagname">${esc(t.tag)}</div>${name ? `<div class="muted small">${esc(name)}</div>` : ""}</td>
+        <td><span class="type">${type}</span></td>
+        <td class="muted">${t.kind}</td>
+        <td class="r" data-tval="${esc(t.tag)}">${this._valCell(v, type, forced)}</td>
+        <td class="nowrap">${modify}</td>
+        <td class="nowrap">${force}${forced ? `<button class="mini" data-tact="release" data-tag="${esc(t.tag)}">Release</button>` : ""}</td>
+        <td>${t.uses.slice(0, 4).map((u) => `<button class="uchip" data-tact="goto" data-pi="${u.pi}" data-id="${esc(u.id)}">${esc(u.label)}</button>`).join("")}${t.uses.length > 4 ? `<span class="muted small">+${t.uses.length - 4}</span>` : ""}</td>
+        <td class="nowrap"><button class="mini ${tracing ? "fon2" : ""}" data-tact="trace" data-tag="${esc(t.tag)}" title="Add to trace">📈</button>${t.kind === "watch" || this._watchList().includes(t.tag) ? `<button class="mini" data-tact="unwatch" data-tag="${esc(t.tag)}" title="Remove from watch">✕</button>` : ""}</td>
+      </tr>`;
+    }).join("");
+  }
+  _valCell(v, type, forced) {
+    if (v === undefined) return `<span class="muted">—</span>`;
+    if (type === "BOOL") { const b = typeof v === "boolean" ? v : ["on", "true", "home", "open", "playing", "detected", "locked"].includes(String(v).toLowerCase()); return `<span class="bpill ${b ? "b1" : ""} ${forced ? "bf" : ""}">${typeof v === "boolean" ? (v ? "1" : "0") : esc(String(v))}</span>`; }
+    const st = typeof v === "number" ? fmtVal(v) : String(v);
+    return `<span class="mono ${forced ? "ftext" : ""}">${esc(st)}</span>`;
+  }
+  _tagsUpdate() {
+    const forces = (this.mon && this.mon.forces) || {};
+    const body = this.shadowRoot.getElementById("tagbody"); if (!body) return;
+    const sig = Object.keys(forces).sort().join("|") + "#" + this._collectTags().length;
+    const focused = this.shadowRoot.activeElement;
+    if (sig !== this._tagSig && !(focused && body.contains(focused))) { this._tagSig = sig; this._tagsBody(); return; }
+    this._tagSig = sig;
+    body.querySelectorAll("[data-tval]").forEach((td) => {
+      const tag = td.dataset.tval, v = this._rawValue(tag);
+      td.innerHTML = this._valCell(v, this._typeOf(tag, v), tag in forces);
+    });
+    this._renderToolbar();
+  }
+  _parseVal(s) {
+    s = String(s).trim();
+    if (/^(true|on)$/i.test(s)) return true;
+    if (/^(false|off)$/i.test(s)) return false;
+    if (s !== "" && !isNaN(+s)) return +s;
+    return s.replace(/^'(.*)'$/, "$1");
+  }
+  async _tagsClick(e) {
+    const f = e.target.closest("[data-tfilter]");
+    if (f) { this.tagFilter = f.dataset.tfilter; this._renderTags(); return; }
+    const b = e.target.closest("[data-tact]"); if (!b) return;
+    const tag = b.dataset.tag, row = b.closest("tr");
+    const ws = (msg) => this._hass.callWS(msg).catch((err) => this._toast(String(err.message || err), true));
+    switch (b.dataset.tact) {
+      case "toggle": { const v = this._rawValue(tag); await ws({ type: "ha_ladder/set_memory", name: tag, value: !v }); break; }
+      case "write": { const inp = row.querySelector("[data-mval]"); if (inp.value.trim() === "") return; await ws({ type: "ha_ladder/set_memory", name: tag, value: this._parseVal(inp.value) }); inp.value = ""; break; }
+      case "f1": await ws({ type: "ha_ladder/force", name: tag, value: true }); break;
+      case "f0": await ws({ type: "ha_ladder/force", name: tag, value: false }); break;
+      case "force": { const inp = row.querySelector("[data-fval]"); if (inp.value.trim() === "") { inp.focus(); return; } await ws({ type: "ha_ladder/force", name: tag, value: this._parseVal(inp.value) }); break; }
+      case "release": await ws({ type: "ha_ladder/unforce", name: tag }); break;
+      case "unforceall": if (confirm("Release all forced tags?")) await ws({ type: "ha_ladder/unforce" }); break;
+      case "trace": this._traceAdd(tag, true); return;
+      case "unwatch": this._saveWatch(this._watchList().filter((x) => x !== tag)); this._tagsBody(); return;
+      case "goto": {
+        this.pi = +b.dataset.pi; const loc = this._locate(b.dataset.id);
+        this.sel = loc ? { rung: loc.rung.id, ids: [b.dataset.id] } : null;
+        this._setView("ladder");
+        const g = this.shadowRoot.querySelector(`[data-id="${b.dataset.id}"]`); if (g) g.scrollIntoView({ block: "center" });
+        return;
+      }
+    }
+    this._tagSig = null;
+  }
+
+  /* ---------- trace ---------- */
+  async _traceLoad() {
+    try {
+      const r = await this._hass.callWS({ type: "ha_ladder/trace/get" });
+      this.trace.signals = r.signals || [];
+      this.trace.data = {};
+      for (const [k, v] of Object.entries(r.data || {})) this.trace.data[k] = v;
+      this._clockSkew = Date.now() / 1000 - (r.now || Date.now() / 1000);
+    } catch (e) { this._toast("Trace: " + (e.message || e), true); }
+    await Promise.all(this.trace.signals.map((s) => this._traceHistory(s)));
+  }
+  async _traceHistory(sig) {
+    // prefill entity signals from HA's recorder (last 24 h)
+    if (sig.startsWith("#") || sig.includes("[") || this.trace.hist[sig]) return;
+    try {
+      const end = new Date(), start = new Date(end - 24 * 3600 * 1000);
+      const r = await this._hass.callWS({ type: "history/history_during_period", start_time: start.toISOString(), end_time: end.toISOString(), entity_ids: [sig], minimal_response: true, no_attributes: true, significant_changes_only: false });
+      const pts = (r[sig] || []).map((h) => [h.lu ?? (h.last_updated ? Date.parse(h.last_updated) / 1000 : 0), this._histVal(h.s ?? h.state)]);
+      this.trace.hist[sig] = pts;
+      this._traceDraw();
+    } catch (e) { this.trace.hist[sig] = []; }
+  }
+  _histVal(s) {
+    if (s === "unavailable" || s === "unknown" || s == null) return null;
+    const n = Number(s);
+    return s !== "" && !isNaN(n) ? n : s;
+  }
+  async _traceAdd(sig, toast = false) {
+    if (this.trace.signals.includes(sig)) { if (toast) this._toast(`${sig} is already in the trace`); return; }
+    if (this.trace.signals.length >= 16) { this._toast("A trace can hold up to 16 signals", true); return; }
+    const signals = [...this.trace.signals, sig];
+    try {
+      const r = await this._hass.callWS({ type: "ha_ladder/trace/set", signals });
+      this.trace.signals = r.signals;
+      if (!this.trace.data[sig]) this.trace.data[sig] = [];
+      if (toast) this._toast(`Tracing ${sig}`);
+    } catch (e) { this._toast("Trace: " + (e.message || e), true); return; }
+    if (this.view === "trace") this._renderTrace(false);
+    else if (this.view === "tags") this._tagsBody();
+    this._traceHistory(sig);
+  }
+  async _traceRemove(sig) {
+    const signals = this.trace.signals.filter((s) => s !== sig);
+    const r = await this._hass.callWS({ type: "ha_ladder/trace/set", signals });
+    this.trace.signals = r.signals;
+    delete this.trace.data[sig]; delete this.trace.hist[sig];
+    this._renderTrace(false);
+  }
+  _series(sig) {
+    // merged history + live points, sorted by time
+    const live = this.trace.data[sig] || [], hist = this.trace.hist[sig] || [];
+    if (!hist.length) return live;
+    const first = live.length ? live[0][0] : Infinity;
+    return hist.filter((p) => p[0] < first).concat(live);
+  }
+  _renderTrace(load = true) {
+    const page = this.shadowRoot.getElementById("page");
+    const presets = [["10s", 10], ["1m", 60], ["5m", 300], ["15m", 900], ["1h", 3600], ["6h", 21600], ["24h", 86400]];
+    page.innerHTML = `
+      <div class="pagehead">
+        <h2>Trace</h2>
+        <div class="chiprow">${presets.map(([l, sp]) => `<button class="pchip ${Math.abs(this.tview.span - sp) < 0.5 ? "on" : ""}" data-span="${sp}">${l}</button>`).join("")}</div>
+        <button class="mini" data-zoom="0.5" title="Zoom in">＋</button><button class="mini" data-zoom="2" title="Zoom out">－</button>
+        <button class="mini ${this.tview.live ? "fon2" : ""}" data-live="1" title="Follow the current time">● Live</button>
+        <button class="mini" data-csv="1" title="Download the visible data as CSV">CSV</button>
+        <span class="muted small hidenarrow">Wheel/pinch to zoom · drag to pan · double-click for live</span>
+        <div class="spacer"></div>
+        <div class="pickwrap addwatch"><input data-pick="trace" placeholder="＋ Add signal: entity or #tag…" autocomplete="off" spellcheck="false"></div>
+      </div>
+      <div class="tracewrap">
+        <div class="legend" id="legend"></div>
+        <div class="chartbox" id="chartbox"><canvas id="chart"></canvas></div>
+      </div>`;
+    this._traceLegend();
+    this._traceBindChart();
+    this._traceDraw();
+    if (load) this._traceLoad().then(() => { this._traceLegend(); this._traceDraw(); });
+  }
+  _colors() {
+    return ["#2fb5ff", "#ff8a3d", "#2fd36b", "#e05bff", "#ffd23d", "#ff5f7e", "#5ef2e0", "#a78bfa", "#f472b6", "#84cc16", "#fb923c", "#38bdf8", "#facc15", "#34d399", "#c084fc", "#f87171"];
+  }
+  _traceLegend() {
+    const lg = this.shadowRoot.getElementById("legend"); if (!lg) return;
+    const C = this._colors();
+    if (!this.trace.signals.length) { lg.innerHTML = `<div class="muted small pad">No signals yet. Add entities or #tags above, or use 📈 on the Tags page.</div>`; return; }
+    lg.innerHTML = this.trace.signals.map((s, i) => {
+      const st = this._hass.states[s.replace(/\[.*$/, "")];
+      const name = s.startsWith("#") ? s : st ? st.attributes.friendly_name || s : s;
+      return `<div class="lrow ${this.trace.hidden[s] ? "off" : ""}" data-sig="${esc(s)}">
+        <button class="sw" data-vis="${esc(s)}" style="background:${C[i % C.length]}" title="Show/hide"></button>
+        <div class="lname"><div>${esc(name)}</div><div class="muted mono small">${esc(s)}</div></div>
+        <div class="lval mono" data-lval="${esc(s)}"></div>
+        <button class="mini x" data-rm="${esc(s)}" title="Remove">✕</button></div>`;
+    }).join("");
+    this._traceLegendUpdate();
+  }
+  _traceLegendUpdate() {
+    for (const el of this.shadowRoot.querySelectorAll("[data-lval]")) {
+      const s = el.dataset.lval;
+      const v = this._cursorT != null ? this._valueAt(this._series(s), this._cursorT) : this._rawValue(s);
+      el.textContent = fmtVal(v === undefined ? null : v);
+      el.classList.toggle("atcursor", this._cursorT != null);
+    }
+  }
+  _valueAt(pts, t) {
+    let lo = 0, hi = pts.length - 1, ans = -1;
+    while (lo <= hi) { const m = (lo + hi) >> 1; if (pts[m][0] <= t) { ans = m; lo = m + 1; } else hi = m - 1; }
+    return ans >= 0 ? pts[ans][1] : undefined;
+  }
+  _traceClick(e) {
+    const t = e.target;
+    const sp = t.closest("[data-span]");
+    if (sp) { this.tview.span = +sp.dataset.span; if (this.tview.live) this.tview.end = this._nowS(); this._renderTraceHead(); this._traceDraw(); return; }
+    const z = t.closest("[data-zoom]");
+    if (z) { this._zoomAt(+z.dataset.zoom, null); return; }
+    if (t.closest("[data-live]")) { this.tview.live = !this.tview.live; if (this.tview.live) this.tview.end = this._nowS(); this._renderTraceHead(); this._traceDraw(); return; }
+    if (t.closest("[data-csv]")) { this._traceCsv(); return; }
+    const rm = t.closest("[data-rm]"); if (rm) { this._traceRemove(rm.dataset.rm); return; }
+    const vis = t.closest("[data-vis]"); if (vis) { const s = vis.dataset.vis; this.trace.hidden[s] = !this.trace.hidden[s]; this._traceLegend(); this._traceDraw(); }
+  }
+  _renderTraceHead() {
+    const page = this.shadowRoot.getElementById("page");
+    page.querySelectorAll("[data-span]").forEach((b) => b.classList.toggle("on", Math.abs(this.tview.span - +b.dataset.span) < 0.5));
+    const l = page.querySelector("[data-live]"); if (l) l.classList.toggle("fon2", this.tview.live);
+  }
+  _nowS() { return Date.now() / 1000 - (this._clockSkew || 0); }
+  _zoomAt(f, tAnchor) {
+    const v = this.tview;
+    const span = Math.min(7 * 86400, Math.max(1, v.span * f));
+    if (v.live || tAnchor == null) { const a = tAnchor == null ? v.end : tAnchor; const start = v.end - v.span; const ns = a - (a - start) * (span / v.span); v.end = v.live ? v.end : ns + span; }
+    else { const start = v.end - v.span; const ns = tAnchor - (tAnchor - start) * (span / v.span); v.end = ns + span; }
+    v.span = span;
+    this._renderTraceHead();
+    this._traceDraw();
+  }
+  _traceBindChart() {
+    const cv = this.shadowRoot.getElementById("chart"); if (!cv) return;
+    const pts = new Map();
+    let pan = null, pinch = null;
+    const tAt = (clientX) => { const r = cv.getBoundingClientRect(); const L = this._chartL || 60; const w = r.width - L - 12; const v = this.tview; return v.end - v.span + ((clientX - r.left - L) / w) * v.span; };
+    cv.addEventListener("wheel", (e) => { e.preventDefault(); const f = e.deltaY > 0 ? 1.25 : 0.8; this._zoomAt(f, tAt(e.clientX)); }, { passive: false });
+    cv.addEventListener("pointerdown", (e) => {
+      cv.setPointerCapture(e.pointerId); pts.set(e.pointerId, e.clientX);
+      if (pts.size === 1) pan = { x: e.clientX, end: this.tview.end };
+      if (pts.size === 2) { const xs = [...pts.values()]; pinch = { d: Math.abs(xs[0] - xs[1]), span: this.tview.span, mid: tAt((xs[0] + xs[1]) / 2) }; pan = null; }
+    });
+    cv.addEventListener("pointermove", (e) => {
+      if (pts.has(e.pointerId)) pts.set(e.pointerId, e.clientX);
+      if (pinch && pts.size === 2) {
+        const xs = [...pts.values()], d = Math.max(10, Math.abs(xs[0] - xs[1]));
+        const f = pinch.d / d; this.tview.live = false;
+        const span = Math.min(7 * 86400, Math.max(1, pinch.span * f));
+        const r = cv.getBoundingClientRect(), L = this._chartL || 60, w = r.width - L - 12, frac = (((xs[0] + xs[1]) / 2) - r.left - L) / w;
+        this.tview.span = span; this.tview.end = pinch.mid + (1 - frac) * span;
+        this._renderTraceHead(); this._traceDraw(); return;
+      }
+      if (pan && pts.size === 1) {
+        const r = cv.getBoundingClientRect(), w = r.width - (this._chartL || 60) - 12;
+        const dt = ((e.clientX - pan.x) / w) * this.tview.span;
+        if (Math.abs(e.clientX - pan.x) > 3) { this.tview.live = false; this.tview.end = pan.end - dt; this._renderTraceHead(); }
+      }
+      this._cursorT = e.pointerType === "mouse" || pts.size ? tAt(e.clientX) : null;
+      this._traceLegendUpdate();
+      this._traceDraw();
+    });
+    const up = (e) => { pts.delete(e.pointerId); if (pts.size < 2) pinch = null; if (!pts.size) pan = null; };
+    cv.addEventListener("pointerup", up);
+    cv.addEventListener("pointercancel", up);
+    cv.addEventListener("pointerleave", () => { if (!pts.size) { this._cursorT = null; this._traceLegendUpdate(); this._traceDraw(); } });
+    cv.addEventListener("dblclick", () => { this.tview.live = true; this.tview.end = this._nowS(); this._renderTraceHead(); this._traceDraw(); });
+    if (this._ro) this._ro.disconnect();
+    this._ro = new ResizeObserver(() => this._traceDraw());
+    this._ro.observe(this.shadowRoot.getElementById("chartbox"));
+  }
+  _traceDraw() {
+    const cv = this.shadowRoot.getElementById("chart"); if (!cv || this.view !== "trace") return;
+    const box = cv.parentElement.getBoundingClientRect();
+    const sigs = this.trace.signals.filter((s) => !this.trace.hidden[s]);
+    const C = this._colors();
+    const css = getComputedStyle(this);
+    const fg = css.getPropertyValue("--fg").trim() || "#222", muted = css.getPropertyValue("--muted").trim() || "#888", line = css.getPropertyValue("--line").trim() || "rgba(0,0,0,.1)";
+    // lane layout
+    const kinds = sigs.map((s) => this._laneKind(s));
+    const laneH = kinds.map((k) => (k === "analog" ? 120 : k === "text" ? 46 : 40));
+    const L = 60, R = 12, T = 8, AX = 26;
+    this._chartL = L;
+    const H = Math.max(box.height, T + laneH.reduce((a, b) => a + b + 6, 0) + AX);
+    const W = Math.max(200, box.width);
+    const dpr = window.devicePixelRatio || 1;
+    cv.width = W * dpr; cv.height = H * dpr; cv.style.width = W + "px"; cv.style.height = H + "px";
+    const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, W, H);
+    const v = this.tview;
+    if (v.live) v.end = this._nowS();
+    const t0 = v.end - v.span, t1 = v.end, pw = W - L - R;
+    const X = (t) => L + ((t - t0) / (t1 - t0)) * pw;
+    // time grid
+    const step = this._niceStep(v.span / Math.max(2, pw / 110));
+    g.font = "11px system-ui, sans-serif"; g.textAlign = "center"; g.textBaseline = "top";
+    for (let t = Math.ceil(t0 / step) * step; t <= t1; t += step) {
+      const x = X(t);
+      g.strokeStyle = line; g.lineWidth = 1; g.beginPath(); g.moveTo(x, T); g.lineTo(x, H - AX); g.stroke();
+      g.fillStyle = muted; g.fillText(this._tlabel(t, step), x, H - AX + 6);
+    }
+    if (!sigs.length) { g.fillStyle = muted; g.textAlign = "center"; g.fillText("Add signals to start tracing", W / 2, H / 2 - 20); return; }
+    let y = T;
+    const now = this._nowS();
+    sigs.forEach((s, i) => {
+      const h = laneH[i], col = C[this.trace.signals.indexOf(s) % C.length], kind = kinds[i];
+      g.fillStyle = line; g.fillRect(L, y + h + 2, pw, 1);
+      g.fillStyle = muted; g.textAlign = "right"; g.textBaseline = "middle"; g.font = "10px ui-monospace, monospace";
+      const pts = this._series(s);
+      // visible slice incl. the point before t0
+      let a = 0, b = pts.length - 1, first = 0;
+      while (a <= b) { const m = (a + b) >> 1; if (pts[m][0] < t0) { first = m; a = m + 1; } else b = m - 1; }
+      const vis = [];
+      for (let k = first; k < pts.length && pts[k][0] <= t1; k++) vis.push(pts[k]);
+      const lastT = Math.min(t1, now);
+      g.save(); g.beginPath(); g.rect(L, y, pw, h); g.clip();
+      g.strokeStyle = col; g.fillStyle = col; g.lineWidth = 1.8;
+      if (kind === "digital") {
+        const yy = (b) => (b ? y + 6 : y + h - 6);
+        g.fillStyle = muted; g.textAlign = "right";
+        g.beginPath();
+        let started = false, prevY = null;
+        for (let k = 0; k < vis.length; k++) {
+          const [t, val] = vis[k]; const tn = k + 1 < vis.length ? vis[k + 1][0] : lastT;
+          if (val === null || val === undefined) { started = false; continue; }
+          const on = this._truthy(val); const x1 = X(Math.max(t, t0)), x2 = X(Math.min(tn, t1)), yy1 = yy(on);
+          if (!started) { g.moveTo(x1, yy1); started = true; } else g.lineTo(x1, prevY), g.lineTo(x1, yy1);
+          g.lineTo(x2, yy1); prevY = yy1;
+          if (on) { g.save(); g.globalAlpha = 0.18; g.fillStyle = col; g.fillRect(x1, yy1, x2 - x1, y + h - 6 - yy1); g.restore(); }
+        }
+        g.strokeStyle = col; g.stroke();
+      } else if (kind === "analog") {
+        let mn = Infinity, mx = -Infinity;
+        for (const [, val] of vis) if (typeof val === "number") { mn = Math.min(mn, val); mx = Math.max(mx, val); }
+        if (mn === Infinity) { mn = 0; mx = 1; }
+        if (mn === mx) { mn -= 1; mx += 1; }
+        const pad = (mx - mn) * 0.1; mn -= pad; mx += pad;
+        const Y = (val) => y + h - 4 - ((val - mn) / (mx - mn)) * (h - 8);
+        g.beginPath(); let started = false, prevY = null;
+        for (let k = 0; k < vis.length; k++) {
+          const [t, val] = vis[k]; const tn = k + 1 < vis.length ? vis[k + 1][0] : lastT;
+          if (typeof val !== "number") { started = false; continue; }
+          const x1 = X(Math.max(t, t0)), x2 = X(Math.min(tn, t1)), yv = Y(val);
+          if (!started) { g.moveTo(x1, yv); started = true; } else { g.lineTo(x1, prevY); g.lineTo(x1, yv); }
+          g.lineTo(x2, yv); prevY = yv;
+        }
+        g.stroke();
+        g.restore(); g.save();
+        g.fillStyle = muted; g.textAlign = "right"; g.font = "10px ui-monospace, monospace";
+        g.fillText(fmtVal(+(mx - pad).toPrecision(4)), L - 6, y + 10); g.fillText(fmtVal(+(mn + pad).toPrecision(4)), L - 6, y + h - 10);
+      } else {
+        // text / enum lane: bands with labels
+        for (let k = 0; k < vis.length; k++) {
+          const [t, val] = vis[k]; const tn = k + 1 < vis.length ? vis[k + 1][0] : lastT;
+          if (val === null || val === undefined) continue;
+          const x1 = X(Math.max(t, t0)), x2 = X(Math.min(tn, t1));
+          g.globalAlpha = 0.16; g.fillRect(x1, y + 8, Math.max(1, x2 - x1), h - 16); g.globalAlpha = 1;
+          g.fillRect(x1, y + 8, 1.5, h - 16);
+          if (x2 - x1 > 30) { g.fillStyle = fg; g.textAlign = "left"; g.font = "11px system-ui"; g.fillText(trunc(String(val), Math.floor((x2 - x1) / 7)), x1 + 5, y + h / 2); g.fillStyle = col; }
+        }
+      }
+      g.restore();
+      // lane label
+      g.fillStyle = col; g.textAlign = "right"; g.textBaseline = "middle"; g.font = "600 10px system-ui";
+      const short = s.startsWith("#") ? s : (this._hass.states[s.replace(/\[.*$/, "")] || { attributes: {} }).attributes.friendly_name || s;
+      g.fillText(trunc(short, 9), L - 6, y + h / 2);
+      // value at cursor
+      if (this._cursorT != null) {
+        const cvv = this._valueAt(pts, this._cursorT);
+        const tx = fmtVal(cvv === undefined ? null : cvv);
+        const cx = X(this._cursorT);
+        g.font = "600 11px ui-monospace, monospace"; const tw = g.measureText(tx).width + 10;
+        const bx = cx + 6 + tw > W - R ? cx - 6 - tw : cx + 6;
+        g.fillStyle = col; g.globalAlpha = 0.9; g.fillRect(bx, y + 3, tw, 17); g.globalAlpha = 1;
+        g.fillStyle = "#fff"; g.textAlign = "left"; g.fillText(tx, bx + 5, y + 12);
+      }
+      y += h + 6;
+    });
+    // cursor + now line
+    if (now >= t0 && now <= t1) { g.strokeStyle = muted; g.setLineDash([3, 4]); g.beginPath(); g.moveTo(X(now), T); g.lineTo(X(now), H - AX); g.stroke(); g.setLineDash([]); }
+    if (this._cursorT != null && this._cursorT >= t0 && this._cursorT <= t1) {
+      const x = X(this._cursorT);
+      g.strokeStyle = fg; g.lineWidth = 1; g.beginPath(); g.moveTo(x, T); g.lineTo(x, H - AX); g.stroke();
+      g.fillStyle = fg; g.textAlign = "center"; g.textBaseline = "top"; g.font = "600 11px system-ui";
+      const lab = new Date(this._cursorT * 1000).toLocaleTimeString([], { hour12: false }) + (v.span < 60 ? "." + String(Math.floor((this._cursorT % 1) * 1000)).padStart(3, "0") : "");
+      const tw = g.measureText(lab).width + 10;
+      g.fillStyle = css.getPropertyValue("--card").trim() || "#fff"; g.fillRect(x - tw / 2, H - AX + 2, tw, 18);
+      g.fillStyle = fg; g.fillText(lab, x, H - AX + 5);
+    }
+  }
+  _laneKind(sig) {
+    const pts = this._series(sig);
+    let num = 0, bool = 0, text = 0;
+    for (let i = Math.max(0, pts.length - 200); i < pts.length; i++) {
+      const v = pts[i][1];
+      if (typeof v === "boolean") bool++;
+      else if (typeof v === "number") num++;
+      else if (typeof v === "string") (["on", "off", "true", "false", "home", "not_home", "open", "closed", "detected", "clear"].includes(v.toLowerCase()) ? bool++ : text++);
+    }
+    if (/\.Q$/i.test(sig)) return "digital";
+    if (num >= bool && num >= text && num > 0) return "analog";
+    if (text > bool) return "text";
+    if (bool) return "digital";
+    const cur = this._rawValue(sig);
+    return typeof cur === "number" ? "analog" : typeof cur === "string" && !["on", "off"].includes(cur) ? "text" : "digital";
+  }
+  _truthy(v) { return typeof v === "boolean" ? v : typeof v === "number" ? v !== 0 : ["on", "true", "home", "open", "detected", "playing", "locked"].includes(String(v).toLowerCase()); }
+  _niceStep(raw) {
+    const steps = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
+    return steps.find((s) => s >= raw) || 86400;
+  }
+  _tlabel(t, step) {
+    const d = new Date(t * 1000);
+    const hh = String(d.getHours()).padStart(2, "0"), mm = String(d.getMinutes()).padStart(2, "0"), ss = String(d.getSeconds()).padStart(2, "0");
+    if (step < 1) return `${mm}:${ss}.${String(d.getMilliseconds()).padStart(3, "0").slice(0, 1)}`;
+    if (step < 60) return `${hh}:${mm}:${ss}`;
+    if (step >= 86400) return d.toLocaleDateString([], { day: "numeric", month: "short" });
+    return `${hh}:${mm}`;
+  }
+  _traceCsv() {
+    const v = this.tview, t0 = v.end - v.span;
+    const rows = [["time", ...this.trace.signals]];
+    const times = new Set();
+    for (const s of this.trace.signals) for (const p of this._series(s)) if (p[0] >= t0 && p[0] <= v.end) times.add(p[0]);
+    for (const t of [...times].sort((a, b) => a - b)) rows.push([new Date(t * 1000).toISOString(), ...this.trace.signals.map((s) => { const x = this._valueAt(this._series(s), t); return x == null ? "" : String(x); })]);
+    const blob = new Blob([rows.map((r) => r.map((c) => /[",\n]/.test(c) ? `"${c.replace(/"/g, '""')}"` : c).join(",")).join("\n")], { type: "text/csv" });
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "ladder-trace.csv"; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  }
+
   /* ---------- live refresh ---------- */
   _tick(fromMonitor = false) {
     if (!this._loaded || (this._drag && this._drag.active)) return;
@@ -1259,6 +2112,8 @@ class LadderPanel extends HTMLElement {
     this._raf = requestAnimationFrame(() => {
       this._raf = null;
       this._renderToolbar();
+      if (this.view === "tags") { this._tagsUpdate(); return; }
+      if (this.view === "trace") { this._traceLegendUpdate(); this._traceDraw(); return; }
       if (this._wasRunning !== !!(this.mon && this.mon.running)) {
         this._wasRunning = !!(this.mon && this.mon.running);
         this._renderCanvas();
@@ -1270,7 +2125,7 @@ class LadderPanel extends HTMLElement {
       } else {
         props.querySelectorAll("[data-live]").forEach((d) => {
           const inp = props.querySelector(`[data-field="${d.dataset.live}"]`);
-          if (inp) d.textContent = this._operandHint(inp.value);
+          if (inp) d.innerHTML = this._operandChip(inp.value);
         });
       }
     });
@@ -1331,6 +2186,81 @@ header { display: flex; align-items: center; gap: 8px; padding: 0 12px; height: 
 :host([narrow]) .menu { display: inline-block; }
 :host([narrow]) .title { display: none; }
 .icon { background: none; border: 0; font-size: 20px; padding: 6px; }
+.views { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; flex: none; }
+.views button { border: 0; background: transparent; padding: 6px 12px; font-size: 13px; }
+.views button.on { background: var(--accent); color: #fff; }
+.forcepill { border: 0; background: #f59e0b; color: #1b1300; font-weight: 700; border-radius: 12px; padding: 4px 10px; font-size: 12px; white-space: nowrap; animation: fpulse 2s infinite; }
+@keyframes fpulse { 50% { opacity: .65; } }
+:host(:not([view])) #page, :host([view="ladder"]) #page { display: none; }
+:host([view="tags"]) .body, :host([view="trace"]) .body { grid-template-columns: 1fr !important; grid-template-rows: 1fr !important; }
+:host([view="tags"]) .palette, :host([view="tags"]) .props, :host([view="trace"]) .palette, :host([view="trace"]) .props { display: none !important; }
+#page { overflow: auto; padding: 14px 18px 40px; min-width: 0; }
+.pagehead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.pagehead h2 { margin: 0 8px 0 0; font-size: 20px; font-weight: 500; }
+.search { padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); min-width: 180px; font: inherit; }
+.chiprow { display: flex; gap: 4px; flex-wrap: wrap; }
+.addwatch { position: relative; min-width: 260px; }
+.addwatch input { width: 100%; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); font: 13px system-ui; }
+.addwatch .pickpop { min-width: 340px; right: 0; left: auto; }
+.small { font-size: 11.5px; }
+.pad { padding: 12px; }
+.tablewrap { overflow-x: auto; background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+table.tags { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.tags th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; padding: 9px 10px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--card); }
+table.tags td { padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+table.tags tr:last-child td { border-bottom: 0; }
+table.tags tr.forced { background: color-mix(in srgb, #f59e0b 10%, transparent); }
+table.tags .r { text-align: right; }
+table.tags .empty { text-align: center; padding: 30px; }
+.nowrap { white-space: nowrap; }
+.nowrap .mini { margin-left: 3px; }
+.tagname { font-weight: 600; }
+.type { font: 600 10.5px ui-monospace, monospace; border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; color: var(--muted); }
+.tagin { width: 76px !important; padding: 3px 6px !important; }
+.fmark { display: inline-block; background: #f59e0b; color: #1b1300; font: 700 10px system-ui; border-radius: 4px; padding: 1px 5px; }
+.mini.fon { background: #f59e0b; border-color: #f59e0b; color: #1b1300; font-weight: 700; }
+.mini.fon2 { background: var(--accent); border-color: var(--accent); color: #fff; }
+.bpill { display: inline-block; min-width: 26px; text-align: center; border-radius: 10px; padding: 1px 8px; font: 600 12px ui-monospace, monospace; background: var(--bg); border: 1px solid var(--line); }
+.bpill.b1 { background: var(--on); border-color: var(--on); color: #fff; }
+.bpill.bf { outline: 2px solid #f59e0b; outline-offset: 1px; }
+.ftext { color: #f59e0b; font-weight: 700; }
+.uchip { border: 1px solid var(--line); background: var(--bg); border-radius: 6px; padding: 1px 6px; font: 11px ui-monospace, monospace; margin: 1px 3px 1px 0; color: var(--accent); }
+.uchip:hover { border-color: var(--accent); }
+.fbadge { fill: #f59e0b; }
+.fbadget { fill: #1b1300; font: 800 9px system-ui; }
+.tracewrap { display: grid; grid-template-columns: 250px 1fr; gap: 12px; height: calc(100% - 50px); min-height: 360px; }
+.legend { background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow-y: auto; }
+.lrow { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+.lrow.off { opacity: .45; }
+.sw { width: 14px; height: 14px; border-radius: 4px; border: 0; flex: none; padding: 0; }
+.lname { flex: 1; min-width: 0; font-size: 12.5px; }
+.lname div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lval { font-size: 12px; font-weight: 600; color: var(--accent); max-width: 70px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lval.atcursor { color: var(--fg); }
+.mini.x { padding: 1px 6px; }
+.chartbox { position: relative; background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: auto; min-height: 300px; }
+.val.fval { fill: #f59e0b; }
+:host([narrow]) .hidenarrow, :host([narrow]) #theme { display: none; }
+:host([narrow]:not([view="ladder"])) #undo, :host([narrow]:not([view="ladder"])) #online { display: none; }
+:host([narrow]) table.tags thead { display: none; }
+:host([narrow]) table.tags tr { display: grid; grid-template-columns: 22px 1fr auto; gap: 6px 8px; padding: 9px 10px; border-bottom: 1px solid var(--line); }
+:host([narrow]) table.tags td { display: block; padding: 0; border: 0; }
+:host([narrow]) table.tags td:nth-child(1) { grid-column: 1; grid-row: 1; }
+:host([narrow]) table.tags td:nth-child(2) { grid-column: 2; grid-row: 1; min-width: 0; overflow: hidden; }
+:host([narrow]) table.tags td:nth-child(5) { grid-column: 3; grid-row: 1; }
+:host([narrow]) table.tags td:nth-child(3), :host([narrow]) table.tags td:nth-child(4), :host([narrow]) table.tags td:nth-child(8) { display: none; }
+:host([narrow]) table.tags td:nth-child(6) { grid-column: 2 / 4; grid-row: 2; }
+:host([narrow]) table.tags td:nth-child(7) { grid-column: 2 / 3; grid-row: 3; }
+:host([narrow]) table.tags td:nth-child(9) { grid-column: 3; grid-row: 3; text-align: right; }
+:host([narrow]) table.tags td:nth-child(6):has(> .muted:only-child) { display: none; }
+:host([narrow]) .addwatch { min-width: 0; width: 100%; }
+.chartbox canvas { display: block; touch-action: none; cursor: crosshair; }
+.charthint { position: absolute; right: 10px; top: 6px; font-size: 10.5px; color: var(--muted); pointer-events: none; }
+:host([narrow]) .tracewrap { grid-template-columns: 1fr; grid-template-rows: auto 1fr; height: auto; }
+:host([narrow]) .legend { max-height: 180px; }
+:host([narrow]) .chartbox { min-height: 420px; }
+:host([narrow]) .views button { padding: 6px 8px; }
+:host([narrow]) .forcepill { display: none; }
 .tabs { display: flex; gap: 4px; flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: none; }
 .tab { border: 1px solid var(--line); background: transparent; border-radius: 16px; padding: 4px 12px; white-space: nowrap; display: flex; align-items: center; gap: 6px; }
 .tab .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--on); }
@@ -1438,7 +2368,39 @@ section.rung.rdrop-after { box-shadow: 0 4px 0 0 var(--accent); }
 .num { width: 80px; padding: 3px 6px; }
 .field input:focus, .field select:focus, .field textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 .chk.row { display: flex; margin-bottom: 10px; color: var(--fg); font-size: 13px; }
-.live { font-size: 11px; color: var(--accent); margin-top: 3px; min-height: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.live { font-size: 11px; margin-top: 4px; min-height: 13px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 3px 8px; border-radius: 12px; background: var(--bg); border: 1px solid var(--line); font-size: 11.5px; overflow: hidden; white-space: nowrap; }
+.chip b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.chip i { color: var(--accent); font-style: normal; font-family: ui-monospace, monospace; }
+.chip .cval { color: var(--accent); font-family: ui-monospace, monospace; font-weight: 600; margin-left: auto; }
+.chip.warn { color: var(--err); border-color: var(--err); }
+.picker-field { position: relative; }
+.pickwrap { display: flex; position: relative; }
+.pickwrap input { padding-right: 30px !important; }
+.pickbtn { position: absolute; right: 2px; top: 2px; bottom: 2px; width: 26px; border: 0; background: transparent; color: var(--muted); border-radius: 4px; }
+.pickbtn:hover { color: var(--accent); }
+.pickpop { position: absolute; left: 0; right: 0; z-index: 30; margin-top: 4px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.25); overflow: hidden; }
+.pchips { display: flex; gap: 4px; padding: 6px; overflow-x: auto; border-bottom: 1px solid var(--line); scrollbar-width: none; }
+.pchip { white-space: nowrap; border: 1px solid var(--line); background: transparent; border-radius: 12px; padding: 2px 8px; font-size: 11px; color: var(--muted); }
+.pchip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.plist { max-height: 320px; overflow-y: auto; overscroll-behavior: contain; }
+.psec { font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 8px 10px 3px; }
+.popt { display: flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: pointer; }
+.popt:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.popt.hi { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.popt.dim { opacity: .6; }
+.picon { width: 22px; text-align: center; flex: none; font-size: 14px; }
+.pmain { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.pname { font-size: 13px; line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.psub { font: 10.5px/1.5 ui-monospace, Menlo, monospace; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pdesc { font-size: 11px; color: var(--muted); }
+.pstate { font: 600 11px ui-monospace, monospace; color: var(--accent); flex: none; max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pmore { padding: 8px 10px; font-size: 11px; color: var(--muted); }
+.pattrs { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 10px; }
+.pattr { display: flex; flex-direction: column; align-items: flex-start; border: 1px solid var(--line); background: var(--bg); border-radius: 8px; padding: 4px 8px; font-size: 11px; }
+.pattr b { font-family: ui-monospace, monospace; }
+.pattr span { color: var(--accent); font-family: ui-monospace, monospace; }
+.pattr.on, .pattr:hover { border-color: var(--accent); }
 .help { font-size: 11px; color: var(--muted); margin-top: 3px; line-height: 1.45; }
 ul.help { padding-left: 16px; }
 ul.help li { margin-bottom: 5px; }

@@ -11,7 +11,17 @@ const states = {
   "person.me": st("home", {friendly_name: "Me"}),
   "sun.sun": st("below_horizon", {elevation: -12}),
   "switch.porch": st("off", {friendly_name: "Porch Light"}),
+  "binary_sensor.kitchen_motion": st("off", {friendly_name: "Kitchen Motion"}),
+  "binary_sensor.hallway_motion_battery_low": st("off", {friendly_name: "Hallway Motion Battery low"}),
+  "sensor.hallway_temperature": st("21.6", {friendly_name: "Hallway Temperature", unit_of_measurement: "°C"}),
+  "light.kitchen_downlights": st("off", {friendly_name: "Kitchen Downlights", brightness: null, color_temp_kelvin: 3000, supported_color_modes: ["color_temp"]}),
+  "input_boolean.guest_mode": st("off", {friendly_name: "Guest Mode"}),
+  "climate.living": st("cool", {friendly_name: "Living AC", temperature: 23, current_temperature: 25.5, hvac_modes: ["off","cool"]}),
+  "cover.bedroom_blind": st("open", {friendly_name: "Bedroom Blind", current_position: 100}),
+  "media_player.dining": st("idle", {friendly_name: "Dining Speaker", volume_level: 0.35}),
+  "lawn_mower.yuka": st("docked", {friendly_name: "Yuka"}),
 };
+for (let i = 0; i < 300; i++) states["sensor.filler_" + i] = st(String(i), {friendly_name: "Filler sensor " + i});
 const sample = [{id:"main", name:"Hallway", enabled:true, rungs:[
  {id:"r1", comment:"Hall light on motion after dark, 2 min run-on", enabled:true,
   logic:{id:"s1",t:"series",items:[
@@ -27,12 +37,36 @@ const sample = [{id:"main", name:"Hallway", enabled:true, rungs:[
  {id:"r3", comment:"", enabled:true, logic:{id:"s3",t:"series",items:[{id:"g1",t:"el",type:"NC",tag:"#hall_used"},{id:"g2",t:"el",type:"RANGE",a:"sensor.living_lux",min:"0",max:"50"}]}, outputs:[]},
 ]}];
 window.saved = null; window.calls = [];
+const forces = {}; const mem = {hall_used:true, reset_count:false, setpoint: 22};
+let traceSigs = ["binary_sensor.hallway_motion", "sensor.hallway_temperature", "#T1.ET", "climate.living"];
+const traceBuf = {}; const T0 = Date.now()/1000 - 900;
+for (const s of traceSigs) traceBuf[s] = [];
+for (let t = T0; t < Date.now()/1000; t += 0.5) {
+  const m = Math.floor(t/20)%3===0; const last = traceBuf["binary_sensor.hallway_motion"].at(-1);
+  if (!last || last[1] !== (m ? "on" : "off")) traceBuf["binary_sensor.hallway_motion"].push([t, m ? "on" : "off"]);
+  if (Math.round(t*2) % 20 === 0) traceBuf["sensor.hallway_temperature"].push([t, Math.round((21 + Math.sin(t/60))*100)/100]);
+  if (Math.round(t*2) % 6 === 0) traceBuf["#T1.ET"].push([t, m ? 0 : Math.min(120, (t % 60))]);
+  if (Math.round(t*2) % 240 === 0) traceBuf["climate.living"].push([t, ["cool","off","cool","fan_only"][Math.floor(t/120)%4]]);
+}
 let monCb = null;
 const hass = {
-  states, services: {light:{turn_on:{},turn_off:{}}, notify:{mobile_app_phone:{}}},
+  states,
+  services: {light:{turn_on:{name:"Turn on",description:"Turns on one or more lights and adjusts their properties."},turn_off:{name:"Turn off"},toggle:{name:"Toggle"}},
+    notify:{mobile_app_phone:{name:"Send a notification via mobile_app_phone"},persistent_notification:{name:"Persistent notification"}},
+    script:{morning_brief_read_aloud:{name:"Morning brief read aloud"}}, tts:{speak:{name:"Speak",description:"Speaks something using text-to-speech."}}},
+  areas: {hall:{area_id:"hall",name:"Hallway"}, kitchen:{area_id:"kitchen",name:"Kitchen"}, living:{area_id:"living",name:"Living Room"}},
+  devices: {d1:{id:"d1",name:"Hue motion sensor",area_id:"hall"}},
+  entities: {"binary_sensor.hallway_motion":{device_id:"d1"}, "binary_sensor.hallway_motion_battery_low":{device_id:"d1",entity_category:"diagnostic"},
+    "light.hallway":{area_id:"hall"}, "binary_sensor.kitchen_motion":{area_id:"kitchen"}, "light.kitchen_downlights":{area_id:"kitchen"}, "climate.living":{area_id:"living"}, "sensor.hallway_temperature":{device_id:"d1"}},
   callWS: async (m) => { calls.push(m);
     if (m.type==="ha_ladder/get") return {programs: JSON.parse(JSON.stringify(sample)), settings:{scan_ms:250}, running:true};
     if (m.type==="ha_ladder/save") { saved = m.programs; return {ok:true}; }
+    if (m.type==="ha_ladder/force") { forces[m.name] = m.value; push(); return {key:m.name}; }
+    if (m.type==="ha_ladder/unforce") { if (m.name) delete forces[m.name]; else for (const k in forces) delete forces[k]; push(); return {ok:true}; }
+    if (m.type==="ha_ladder/set_memory") { mem[m.name.replace(/^#/,"")] = m.value; push(); return {ok:true}; }
+    if (m.type==="ha_ladder/trace/set") { traceSigs = m.signals; return {signals: traceSigs}; }
+    if (m.type==="ha_ladder/trace/get") { const data = {}; for (const s of traceSigs) data[s] = traceBuf[s] || []; return {signals: traceSigs, data, now: Date.now()/1000}; }
+    if (m.type==="history/history_during_period") { const out = {}; const now = Date.now()/1000; for (const e of m.entity_ids) { out[e] = []; for (let t = now - 86400; t < now - 600; t += 900) out[e].push({s: e.startsWith("sensor") ? String(20 + 3*Math.sin(t/7200)) : (Math.floor(t/1800)%3===0 ? "on" : "off"), lu: t}); } return out; }
     return {ok:true}; },
   connection: { subscribeMessage: (cb) => { monCb = cb; setTimeout(push, 50); return Promise.resolve(() => {}); } },
 };
@@ -43,7 +77,7 @@ function push() {
     o1:[true,true,true], o2:[true,true,true],
     s2:[true,false,null], f1:[true,false,false], f2:[false,false,"3/10"], o3:[false,false,null],
     s3:[true,true,null], g1:[true,false,true], g2:[false,false,"35"]},
-    e:{}, mem:{hall_used:true, reset_count:false}, ctr:{C1:{cv:3,q:false}}, tmr:{T1:{q:true,et:0}},
+    e:{}, mem, forces: {...forces}, ctr:{C1:{cv:3,q:false}}, tmr:{T1:{q:true,et:0}},
     stats:{count:1234,last_ms:0.21,max_ms:1.4,errors:0,scan_ms:250}});
 }
 const p = document.getElementById("p");

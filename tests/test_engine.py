@@ -259,3 +259,28 @@ def test_edge_toggle_latch(io):
     for v in ["on", "on", "off", "on", "off", "off", "on"]:
         io.set("binary_sensor.btn", v); rt.scan(); states.append(bool(rt.memory.get("lamp")))
     assert states == [True, True, True, False, False, False, True]
+
+
+def test_forces(io):
+    io.set("binary_sensor.btn", "off")
+    io.set("switch.out", "off")
+    rt = E.Runtime(io)
+    rt.load(prog(
+        (S(el("NO", tag="binary_sensor.btn")), [el("COIL", tag="switch.out"), el("COIL", tag="#m")]),
+    ))
+    rt.scan()
+    assert io.calls == [] and rt.memory["m"] is False
+    rt.set_force("binary_sensor.btn", True)  # force an input
+    rt.scan()
+    assert rt.memory["m"] is True and io.calls[-1][1] == "turn_on"
+    rt.set_force("#m", False)  # forced marker ignores the coil
+    rt.scan()
+    assert rt.memory["m"] is False
+    rt.set_force("switch.out", False)  # force an output off while logic says on
+    rt.scan()
+    assert io.calls[-1][1] == "turn_off"
+    rt.clear_force()
+    rt.scan()
+    assert io.calls[-1][1] == "turn_off" and rt.memory["m"] is False  # btn really off again
+    rt2 = E.Runtime(io, {"forces": {"#x": 5}})
+    assert rt2.read("#x") == 5

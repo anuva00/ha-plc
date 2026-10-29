@@ -14,5 +14,5 @@ const { chromium } = require('playwright');
   await pg.screenshot({ path: '/tmp/claude-0/touch.png' }); console.log('target', tx, ty, await pg.evaluate(() => { const d = document.getElementById('p')._drag; return d ? JSON.stringify({a: d.active, t: !!d.target, moved: d.moved}) : 'no drag'; }));
   await t('touchEnd'); await pg.waitForTimeout(150);
   console.log(await pg.evaluate(() => { const r = document.getElementById('p').programs[0].rungs; const f = (n) => n.t === 'el' ? n.type : n.t === 'series' ? n.items.map(f).join(' ') : '(' + n.branches.map(f).join('|') + ')'; return r.map(x => f(x.logic)).join('\n'); }));
-  console.log(await pg.evaluate(()=>window._ev.join(','))); console.log('errors', errs); await b.close();
+   console.log('errors', errs); await b.close();
 })();

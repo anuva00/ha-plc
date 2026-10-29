@@ -52,6 +52,19 @@ lock lock/unlock, scene/button activate, vacuum start/dock, lawn_mower mow/dock.
 Numbers written with MOVE/MATH: input_number/number value, light brightness %,
 cover position, fan %, climate setpoint, media_player volume (0–1).
 
+## Entity picker
+Operand fields have a searchable picker. Search by name, entity id, area or device. Suggestions depend on the field: a contact suggests on/off sources, a coil only switchable entities, a MOVE destination only settable ones. Domain chips filter the list; recently used and in-program entities come first, with live state shown. After you pick an entity you can choose one of its attributes, e.g. `climate.living[current_temperature]`. You can also enter `#markers` or constants. Keyboard: ↑ ↓ Enter Esc.
+
+## Tags page (watch & force table)
+Lists every marker, timer and counter bit/value, every entity the program reads (input) or writes (output), and anything you add to the watch list, all with live values. **Modify** writes a marker or counter once. **Force** holds a tag at a value until released, like a PLC force table:
+* a forced input or marker is read as the forced value, and coils can't change it;
+* a forced output entity is driven to the forced value;
+* forces survive restarts, show an orange **F** in the ladder, and the header shows "F n forced". **Release all** clears them.
+
+## Trace page
+A TIA-style trace / logic analyzer. Add up to 16 entities or #tags (or use 📈 on the Tags page). The runtime records every value change at scan resolution, and entities are pre-filled with the last 24 h from HA's recorder. Each signal gets its own lane: on/off signals as digital steps, numbers as auto-scaled lines, text states as labelled bands.
+Zoom with the mouse wheel / pinch or the presets (10 s → 24 h), drag to pan, double-click to return to **Live**. Hovering shows a cursor with every signal's value at that moment. **CSV** exports the visible window.
+
 ## Editor
 **Drag and drop:** drag instructions from the palette onto a rung, and drag placed elements to move them, within a rung or to another rung. Drop on a wire to insert in series, just below an element to OR it, or on the palette to delete. Drag the ⠿ handle to reorder rungs. On touch screens, press and hold to start a drag.
 

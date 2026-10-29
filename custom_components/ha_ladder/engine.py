@@ -215,6 +215,8 @@ class Runtime:
         self.memory: dict[str, Any] = dict(retain.get("memory", {}))
         self.counters: dict[str, dict] = {k: dict(v) for k, v in retain.get("counters", {}).items()}
         self.tonr: dict[str, float] = dict(retain.get("tonr", {}))
+        # forced tags: "#marker", "entity_id" or "entity_id[attr]" -> value (persist like a PLC force table)
+        self.forces: dict[str, Any] = dict(retain.get("forces", {}))
         self.timers: dict[str, TimerState] = {}
         self.edges: dict[str, Any] = {}  # element id -> previous value
         self.image: dict[str, OutputCmd] = {}  # this scan's output image
@@ -231,7 +233,34 @@ class Runtime:
 
     # -- persistence ------------------------------------------------------
     def retain_data(self) -> dict:
-        return {"memory": self.memory, "counters": self.counters, "tonr": self.tonr}
+        return {"memory": self.memory, "counters": self.counters, "tonr": self.tonr, "forces": self.forces}
+
+    # -- forcing ---------------------------------------------------------------
+    @staticmethod
+    def force_key(raw: Any) -> str | None:
+        op = parse_operand(raw)
+        if op.kind == "mem":
+            return "#" + op.ref
+        if op.kind == "entity":
+            return op.ref
+        if op.kind == "attr":
+            return f"{op.ref}[{op.attr}]"
+        return None
+
+    def set_force(self, raw: Any, value: Any) -> str:
+        key = self.force_key(raw)
+        if key is None:
+            raise ValueError(f"{raw!r} can't be forced")
+        self.forces[key] = value
+        self.dirty = True
+        return key
+
+    def clear_force(self, raw: Any | None = None) -> None:
+        if raw is None:
+            self.forces.clear()
+        else:
+            self.forces.pop(self.force_key(raw) or "", None)
+        self.dirty = True
 
     def load(self, programs: list[dict]) -> None:
         self.programs = programs
@@ -253,6 +282,10 @@ class Runtime:
             return None
         if op.kind == "const":
             return op.value
+        if self.forces:
+            key = self.force_key(raw)
+            if key in self.forces:
+                return self.forces[key]
         if op.kind == "mem":
             return self._read_mem(op.ref)
         state, attrs = self.io.get(op.ref)
@@ -307,6 +340,10 @@ class Runtime:
     # -- writing ------------------------------------------------------------
     def write(self, raw: Any, value: Any, enforce: bool = False) -> None:
         op = parse_operand(raw)
+        if self.forces and op.kind in ("mem", "entity"):
+            key = "#" + op.ref if op.kind == "mem" else op.ref
+            if key in self.forces:
+                value = self.forces[key]  # a forced tag ignores the logic
         if op.kind == "mem":
             if self.memory.get(op.ref) != value:
                 self.memory[op.ref] = value
@@ -318,6 +355,10 @@ class Runtime:
             raise ValueError(f"cannot write to {raw!r}")
 
     def _flush(self) -> None:
+        # forced outputs are driven even when no coil wrote them this scan
+        for key, val in self.forces.items():
+            if key in self.last_cmd and key not in self.image:
+                self.image[key] = OutputCmd(val)
         for entity, cmd in self.image.items():
             state, attrs = self.io.get(entity)
             if state in UNAVAILABLE:

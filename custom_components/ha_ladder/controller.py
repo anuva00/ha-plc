@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from datetime import timedelta
 from typing import Any, Callable
 
@@ -76,6 +77,10 @@ class LadderController:
         self._last_push = 0.0
         self._last_entity_update = 0.0
         self._logged_errors: set[str] = set()
+        # trace recorder: change-only samples per signal
+        self._trace: dict[str, deque] = {}
+        self._trace_last: dict[str, Any] = {}
+        self._trace_pending: dict[str, list] = {}
 
     # -- lifecycle -------------------------------------------------------------
     async def async_load(self) -> None:
@@ -85,6 +90,7 @@ class LadderController:
         retain = await self._retain_store.async_load() or {}
         self.runtime = Runtime(HassIO(self.hass), retain)
         self.runtime.load(self.programs)
+        self._trace_config(self.settings.get("trace") or [])
 
     @property
     def running(self) -> bool:
@@ -153,11 +159,64 @@ class LadderController:
         rt.memory[name] = value
         rt.dirty = True
 
+    # -- forces --------------------------------------------------------------------
+    async def async_force(self, name: str, value: Any) -> str:
+        key = self.runtime.set_force(name, value)
+        _LOGGER.info("Ladder: %s forced to %r", key, value)
+        await self._retain_store.async_save(self.runtime.retain_data())
+        self._push(force=True)
+        return key
+
+    async def async_unforce(self, name: str | None) -> None:
+        self.runtime.clear_force(name)
+        await self._retain_store.async_save(self.runtime.retain_data())
+        self._push(force=True)
+
+    # -- trace -----------------------------------------------------------------------
+    TRACE_MAX_SIGNALS = 16
+    TRACE_MAX_POINTS = 20000
+
+    def _trace_config(self, signals: list[str]) -> None:
+        signals = [str(s).strip() for s in signals if str(s).strip()][: self.TRACE_MAX_SIGNALS]
+        self._trace = {s: self._trace.get(s) or deque(maxlen=self.TRACE_MAX_POINTS) for s in signals}
+        self._trace_last = {s: v for s, v in self._trace_last.items() if s in self._trace}
+        self._trace_pending = {s: [] for s in signals}
+
+    async def async_set_trace(self, signals: list[str]) -> list[str]:
+        self._trace_config(signals)
+        self.settings["trace"] = list(self._trace)
+        await self._save()
+        self._sample_trace(time.time())
+        return list(self._trace)
+
+    def trace_data(self) -> dict:
+        return {"signals": list(self._trace), "data": {s: list(d) for s, d in self._trace.items()}, "now": time.time()}
+
+    @callback
+    def _sample_trace(self, now: float) -> None:
+        rt = self.runtime
+        for sig, buf in self._trace.items():
+            try:
+                v = rt.read(sig)
+            except Exception:  # noqa: BLE001
+                v = None
+            if isinstance(v, float) and v.is_integer():
+                v = int(v)
+            if sig in self._trace_last and self._trace_last[sig] == v and type(self._trace_last[sig]) is type(v):
+                continue
+            self._trace_last[sig] = v
+            pt = (round(now, 3), v)
+            buf.append(pt)
+            if self._monitors:
+                self._trace_pending[sig].append(pt)
+
     # -- scan --------------------------------------------------------------------
     @callback
     def _scan(self, _now=None) -> None:
         rt = self.runtime
         rt.scan()
+        if self._trace:
+            self._sample_trace(time.time())
         if rt.dirty:
             rt.dirty = False
             self._retain_store.async_delay_save(rt.retain_data, 10)
@@ -193,6 +252,8 @@ class LadderController:
             "e": rt.errors,
             "mem": {k: v for k, v in rt.memory.items() if isinstance(v, (bool, int, float, str)) or v is None},
             "ctr": rt.counters,
+            "forces": rt.forces,
+            "trace": self._take_trace_pending(),
             "tmr": {k: {"q": t.q, "et": round(t.et, 2)} for k, t in rt.timers.items()},
             "stats": {
                 "count": rt.stats.count,
@@ -202,6 +263,12 @@ class LadderController:
                 "scan_ms": self.settings.get("scan_ms"),
             },
         }
+
+    def _take_trace_pending(self) -> dict:
+        out = {s: p for s, p in self._trace_pending.items() if p}
+        if out:
+            self._trace_pending = {s: [] for s in self._trace}
+        return out
 
     @callback
     def _push(self, force: bool = False) -> None:

@@ -87,6 +87,29 @@ async def test_setup_ws_and_scan(hass: HomeAssistant, hass_ws_client, freezer, m
     monitor = await ws.receive_json()
     assert "o1" in monitor["event"]["m"]
 
+    # trace + force
+    await ws.send_json({"id": 10, "type": "ha_ladder/trace/set", "signals": ["input_boolean.motion", "#T1.ET"]})
+    r = await ws.receive_json()
+    while r.get("type") == "event":
+        r = await ws.receive_json()
+    assert r["result"]["signals"] == ["input_boolean.motion", "#T1.ET"]
+    await ws.send_json({"id": 11, "type": "ha_ladder/force", "name": "input_boolean.motion", "value": True})
+    r = await ws.receive_json()
+    while r.get("type") == "event":
+        r = await ws.receive_json()
+    assert r["success"]
+    for i in range(30, 34):
+        freezer.move_to(now + timedelta(milliseconds=260 * i))
+        async_fire_time_changed(hass, now + timedelta(milliseconds=260 * i))
+        await hass.async_block_till_done()
+    await ws.send_json({"id": 12, "type": "ha_ladder/trace/get"})
+    r = await ws.receive_json()
+    while r.get("type") == "event":
+        r = await ws.receive_json()
+    data = r["result"]["data"]["input_boolean.motion"]
+    assert data[0][1] == "off" and data[-1][1] is True  # forced value recorded
+    assert len(on) == 2  # forced input switched the light on again
+
     # RUN/STOP switch
     await hass.services.async_call("switch", "turn_off", {"entity_id": "switch.ladder_logic_plc_run"}, blocking=True)
     assert hass.states.get("switch.ladder_logic_plc_run").state == "off"

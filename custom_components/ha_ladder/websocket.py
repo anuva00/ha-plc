@@ -17,7 +17,7 @@ def _ctrl(hass: HomeAssistant):
 
 @callback
 def async_register_websocket(hass: HomeAssistant) -> None:
-    for cmd in (ws_get, ws_save, ws_run, ws_settings, ws_monitor, ws_set_memory):
+    for cmd in (ws_get, ws_save, ws_run, ws_settings, ws_monitor, ws_set_memory, ws_force, ws_unforce, ws_trace_set, ws_trace_get):
         websocket_api.async_register_command(hass, cmd)
 
 
@@ -109,3 +109,53 @@ def ws_monitor(hass, connection, msg) -> None:
 
     connection.send_result(msg["id"])
     connection.subscriptions[msg["id"]] = c.add_monitor(forward)
+
+
+_VALUE = vol.Any(bool, int, float, str, None)
+
+
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/force", vol.Required("name"): str, vol.Required("value"): _VALUE})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_force(hass, connection, msg) -> None:
+    c = _ctrl(hass)
+    if c is None:
+        return _not_ready(connection, msg)
+    try:
+        key = await c.async_force(msg["name"], msg["value"])
+    except ValueError as err:
+        connection.send_error(msg["id"], "invalid", str(err))
+        return
+    connection.send_result(msg["id"], {"key": key})
+
+
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/unforce", vol.Optional("name"): str})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_unforce(hass, connection, msg) -> None:
+    c = _ctrl(hass)
+    if c is None:
+        return _not_ready(connection, msg)
+    await c.async_unforce(msg.get("name"))
+    connection.send_result(msg["id"], {"ok": True})
+
+
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/trace/set", vol.Required("signals"): [str]})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_trace_set(hass, connection, msg) -> None:
+    c = _ctrl(hass)
+    if c is None:
+        return _not_ready(connection, msg)
+    signals = await c.async_set_trace(msg["signals"])
+    connection.send_result(msg["id"], {"signals": signals})
+
+
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/trace/get"})
+@websocket_api.require_admin
+@callback
+def ws_trace_get(hass, connection, msg) -> None:
+    c = _ctrl(hass)
+    if c is None:
+        return _not_ready(connection, msg)
+    connection.send_result(msg["id"], c.trace_data())
