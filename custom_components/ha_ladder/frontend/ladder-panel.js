@@ -4,7 +4,7 @@ const CW = 124;        // cell width
 const CH = 92;         // cell height
 const WY = 50;         // wire y inside a cell
 const RAIL = 14;       // rail inset
-const VERSION = "0.2.1";
+const VERSION = "0.3.0";
 
 const PALETTE = [
   { group: "Bit logic", items: [
@@ -202,6 +202,7 @@ class LadderPanel extends HTMLElement {
     this._lastTick = 0;
     this._zones = {};
     this.view = "ladder";
+    try { this._collapsed = new Set(JSON.parse(localStorage.getItem("ha_ladder_collapsed") || "[]")); } catch (e) { this._collapsed = new Set(); }
     this.tagFilter = "all";
     this.tagQuery = "";
     this.trace = { signals: [], data: {}, hist: {}, hidden: {} };
@@ -302,6 +303,7 @@ class LadderPanel extends HTMLElement {
     if (this.undo.length > 80) this.undo.shift();
     this.redo = [];
     fn();
+    this._anGen = (this._anGen || 0) + 1;
     this.prog.rungs.forEach((r) => normalize(r.logic));
     this._setDirty(true);
     if (structural) this._render(); else this._renderCanvas();
@@ -319,6 +321,7 @@ class LadderPanel extends HTMLElement {
     to.push(JSON.stringify({ programs: this.programs, pi: this.pi }));
     const s = JSON.parse(from.pop());
     this.programs = s.programs; this.pi = Math.min(s.pi, this.programs.length - 1);
+    this._anGen = (this._anGen || 0) + 1;
     this.sel = null;
     this._setDirty(true);
     this._render();
@@ -339,6 +342,7 @@ class LadderPanel extends HTMLElement {
     const el = this._newElement(type);
     this._mutate(() => {
       const rung = (sel && this._rung(sel.rung)) || prog.rungs[prog.rungs.length - 1];
+      if (this._collapsed.delete(rung.id)) this._saveCollapsed();
       const loc = sel && sel.ids.length ? this._locate(sel.ids[sel.ids.length - 1]) : null;
       if (OUTPUT_TYPES.has(type)) {
         const idx = loc && loc.where === "outputs" ? loc.index + 1 : rung.outputs.length;
@@ -432,7 +436,8 @@ class LadderPanel extends HTMLElement {
     try {
       await this._hass.callWS({ type: "ha_ladder/save", programs: this.programs });
       this._setDirty(false);
-      this._toast("Saved — the runtime is now using this version");
+      const probs = this._analyze().problems.filter((x) => x.level !== "info");
+      this._toast(probs.length ? `Saved — ${probs.length} check${probs.length > 1 ? "s" : ""} to look at (⚠ in the toolbar)` : "Saved — the runtime is now using this version");
     } catch (e) {
       this._toast("Save failed: " + (e.message || e.code || e), true);
     }
@@ -474,6 +479,8 @@ class LadderPanel extends HTMLElement {
           <button class="tb" id="redo" title="Redo (Ctrl+Y)">↷</button>
           <button class="tb" id="theme" title="Theme: auto / dark / light">◐<span class="wide" id="themelbl"> Auto</span></button>
           <button class="tb" id="online" title="Show live power flow">◉<span class="wide"> Monitor</span></button>
+          <button class="tb" id="checks" title="Program checks" hidden></button>
+          <button class="tb" id="testmode" title="Test mode: run the program without switching anything">🧪<span class="wide"> Test</span></button>
           <button class="tb run" id="run">…</button>
           <button class="tb primary" id="save" title="Save & download to runtime (Ctrl+S)">Save</button>
         </header>
@@ -497,6 +504,8 @@ class LadderPanel extends HTMLElement {
     page.addEventListener("keydown", (e) => { if (e.target.dataset.pick) this._pickKey(e); else if (e.key === "Enter" && e.target.dataset.fval !== undefined) { e.preventDefault(); this._pageClick({ target: e.target.closest("tr").querySelector("[data-tact=force]") }); } });
     page.addEventListener("focusin", (e) => { if (e.target.dataset.pick) this._pickOpen(e.target); });
     page.addEventListener("focusout", (e) => { if (e.target.dataset.pick) setTimeout(() => { if (this._pick && this._pick.input === e.target && this.shadowRoot.activeElement !== e.target) this._pickClose(); }, 120); });
+    $("testmode").onclick = () => this._toggleTest();
+    $("checks").onclick = () => { this.sel = null; this._showChecks = true; if (this.view !== "ladder") this._setView("ladder"); this._renderProps(); this._updateSvgs(); };
     $("undo").onclick = () => this._undo();
     $("redo").onclick = () => this._undo(true);
     $("save").onclick = () => this._save();
@@ -575,6 +584,14 @@ class LadderPanel extends HTMLElement {
       } else { this.pi = +b.dataset.prog; this.sel = null; this._render(); }
     };
     $("tabs").style.visibility = this.view === "ladder" ? "" : "hidden";
+    const sim = !!(this.mon && this.mon.simulate);
+    $("testmode").classList.toggle("test", sim);
+    $("testmode").title = sim ? "TEST MODE is on — outputs are simulated. Click to go live." : "Test mode: run the program without switching anything";
+    const probs = this._analyze().problems.filter((p) => p.level !== "info");
+    const ck = $("checks");
+    ck.hidden = !probs.length;
+    ck.innerHTML = `⚠<span class="wide"> ${probs.length}</span>`;
+    ck.classList.toggle("bad", probs.some((p) => p.level === "error"));
     const nf = Object.keys((this.mon && this.mon.forces) || {}).length;
     $("forcepill").hidden = !nf;
     $("forcepill").textContent = `F ${nf} forced`;
@@ -599,21 +616,26 @@ class LadderPanel extends HTMLElement {
     const c = this.shadowRoot.getElementById("canvas");
     const prog = this.prog;
     if (!prog) return;
-    const status = this.mon && this.mon.running ? "" : `<div class="banner">PLC is in STOP — outputs are not being updated.</div>`;
+    const status = (this.mon && this.mon.running ? "" : `<div class="banner">PLC is in STOP — outputs are not being updated.</div>`)
+      + (this.mon && this.mon.simulate ? `<div class="banner test">🧪 <b>TEST MODE</b> — the program runs but outputs and actions are only simulated; nothing in the house is switched. <button class="mini" data-act="exittest">Go live</button></div>` : "");
     c.innerHTML = `
       ${status}
       <div class="proghead">
         <input class="progname" data-progname value="${esc(prog.name)}" title="Program name">
         <label class="chk"><input type="checkbox" data-progenabled ${prog.enabled ? "checked" : ""}> Enabled</label>
         <div class="spacer"></div>
+        <button class="mini" data-act="collapseall" title="Collapse all rungs">⊟ Collapse</button>
+        <button class="mini" data-act="expandall" title="Expand all rungs">⊞ Expand</button>
         <button class="mini" data-act="export">Export</button>
         <button class="mini" data-act="import">Import</button>
         <button class="mini danger" data-act="delprog">Delete program</button>
       </div>
       ${prog.rungs.map((r, i) => `
-        <section class="rung ${this.sel && this.sel.rung === r.id ? "rsel" : ""} ${r.enabled ? "" : "disabled"}" data-rung="${r.id}">
+        <section class="rung ${this.sel && this.sel.rung === r.id ? "rsel" : ""} ${r.enabled ? "" : "disabled"} ${this._collapsed.has(r.id) ? "collapsed" : ""}" data-rung="${r.id}">
           <div class="rhead">
+            <button class="chev" data-act="collapse" data-r="${r.id}" title="Collapse / expand">${this._collapsed.has(r.id) ? "▸" : "▾"}</button>
             <span class="rnum" data-rhandle="${r.id}" title="Drag to reorder">⠿ ${i + 1}</span>
+            <span class="rled" data-rled="${r.id}" title="Rung result"></span>
             <input class="comment" data-comment="${r.id}" placeholder="Rung comment…" value="${esc(r.comment || "")}">
             <span class="rerr" data-rerr="${r.id}"></span>
             <label class="chk" title="Disabled rungs are skipped"><input type="checkbox" data-rungenable="${r.id}" ${r.enabled ? "checked" : ""}> on</label>
@@ -622,6 +644,7 @@ class LadderPanel extends HTMLElement {
             <button class="mini" data-act="rdup" data-r="${r.id}" title="Duplicate">⧉</button>
             <button class="mini danger" data-act="rdel" data-r="${r.id}" title="Delete rung">✕</button>
           </div>
+          <div class="rsummary" data-rsum="${r.id}">${this._collapsed.has(r.id) ? this._rungSummary(r) : ""}</div>
           <div class="svgwrap" data-svg="${r.id}"></div>
         </section>`).join("")}
       <button class="addrung" data-act="addrung">＋ Add rung</button>
@@ -659,6 +682,7 @@ class LadderPanel extends HTMLElement {
       this.sel = { rung: rungEl.dataset.rung, ids: [] };
     } else return;
     this.shadowRoot.querySelectorAll(".rung").forEach((r) => r.classList.toggle("rsel", this.sel && r.dataset.rung === this.sel.rung));
+    if (this.sel && this.sel.ids.length) this._showChecks = false;
     this._updateSvgs();
     this._renderProps();
   }
@@ -674,6 +698,10 @@ class LadderPanel extends HTMLElement {
     const r = b.dataset.r;
     switch (b.dataset.act) {
       case "addrung": this._addRung(this.sel && this.sel.rung); break;
+      case "exittest": this._toggleTest(); break;
+      case "collapse": this._toggleCollapse(r); break;
+      case "collapseall": this._collapseAll(true); break;
+      case "expandall": this._collapseAll(false); break;
       case "rup": this._moveRung(r, -1); break;
       case "rdown": this._moveRung(r, 1); break;
       case "rdup": this._dupRung(r); break;
@@ -706,6 +734,9 @@ class LadderPanel extends HTMLElement {
         for (const p of list) {
           if (!p || !Array.isArray(p.rungs)) throw new Error("not a ladder program");
           if (ids.has(p.id)) p.id = uid();
+          // fresh element ids so an imported copy never collides with existing rungs
+          const reid = (n) => { if (!n || typeof n !== "object") return; n.id = uid(); (n.items || []).forEach(reid); (n.branches || []).forEach(reid); };
+          p.rungs.forEach((r) => { r.id = uid(); reid(r.logic); (r.outputs || []).forEach(reid); });
           this.programs.push(p);
         }
         this.pi = this.programs.length - 1;
@@ -910,8 +941,15 @@ class LadderPanel extends HTMLElement {
   _updateSvgs() {
     const prog = this.prog; if (!prog) return;
     const cols = this._maxCols();
+    const live = this._live();
     for (const r of prog.rungs) {
+      const led = this.shadowRoot.querySelector(`[data-rled="${r.id}"]`);
+      if (led) {
+        const md = live && r.enabled && prog.enabled && this.mon.m[r.logic.id];
+        led.className = "rled" + (md ? (md[1] ? " on" : " off") : "");
+      }
       const host = this.shadowRoot.querySelector(`[data-svg="${r.id}"]`);
+      if (this._collapsed.has(r.id)) { if (host) host.innerHTML = ""; this._zones[r.id] = []; continue; }
       if (host) host.innerHTML = this._rungSvg(r, cols);
       const err = this.shadowRoot.querySelector(`[data-rerr="${r.id}"]`);
       if (err) {
@@ -1030,6 +1068,7 @@ class LadderPanel extends HTMLElement {
     const t = String(tag || "").trim();
     if (!t) return "";
     if (this.mon && this.mon.forces && t in this.mon.forces) return fmtVal(this.mon.forces[t]) + " (F)";
+    if (this.mon && this.mon.simulate && this.mon.sim && t in this.mon.sim) return fmtVal(this.mon.sim[t]) + " (sim)";
     if (t.startsWith("#")) {
       const n = t.slice(1), mon = this.mon || {};
       const m = /^(.*)\.(Q|ET|CV)$/i.exec(n);
@@ -1059,15 +1098,17 @@ class LadderPanel extends HTMLElement {
     const wcIn = this._wc(ctx, pin), wcOut = this._wc(ctx, po);
     const t = el.type;
     const dragging = this._drag && this._drag.active && this._drag.payload.id === el.id;
-    o.push(`<g class="el ${sel ? "sel" : ""} ${err ? "err" : ""} ${dragging ? "dragging" : ""}" data-id="${el.id}">`);
+    const warn = !err && this._analyze().elWarn.get(el.id);
+    o.push(`<g class="el ${sel ? "sel" : ""} ${err ? "err" : ""} ${warn ? "warn-" + warn.level : ""} ${dragging ? "dragging" : ""}" data-id="${el.id}">`);
     o.push(`<rect class="hit" x="${x0 + 3}" y="${yy - 46}" width="${CW - 6}" height="${CH - 4}" rx="8"/>`);
     if (err) o.push(`<title>${esc(err)}</title>`);
+    else if (warn) o.push(`<title>${esc(warn.msg)}</title>`);
     const label = (tag, yOff = 36) => {
       const L = this._label(tag);
       o.push(`<text class="lbl ${L.warn ? "warn" : ""}" x="${cx}" y="${yy - yOff}" text-anchor="middle">${esc(trunc(L.main, 19))}</text>`);
       if (L.sub) o.push(`<text class="tag" x="${cx}" y="${yy - yOff + 11}" text-anchor="middle">${esc(trunc(L.sub, 20))}</text>`);
     };
-    const valueText = (s) => { if (s !== "" && s !== undefined && s !== null) o.push(`<text class="val ${/\(F\)$/.test(s) ? "fval" : ""}" x="${cx}" y="${yy + 34}" text-anchor="middle">${esc(trunc(s, 20))}</text>`); };
+    const valueText = (s) => { if (s !== "" && s !== undefined && s !== null) o.push(`<text class="val ${/\(F\)$/.test(s) ? "fval" : /\(sim\)$/.test(s) ? "sval" : ""}" x="${cx}" y="${yy + 34}" text-anchor="middle">${esc(trunc(s, 20))}</text>`); };
 
     if (CONTACT_TYPES.has(t)) {
       const v = md ? md[2] : undefined;
@@ -1156,7 +1197,7 @@ class LadderPanel extends HTMLElement {
       if (loc && loc.node.t === "parallel") { p.innerHTML = this._selActions("OR branch", "Insert after it by picking from the palette.", loc); return; }
     }
     if (sel && sel.ids.length > 1) { p.innerHTML = this._selActions(`${sel.ids.length} selected`, "Wrap them in an OR branch or delete them.", null); return; }
-    p.innerHTML = this._watch();
+    p.innerHTML = this._showChecks ? this._checksHtml() : this._watch();
   }
   _selActions(title, hint) {
     return `<div class="phead"><b>${esc(title)}</b><button class="mini" data-pact="close">✕</button></div>
@@ -1192,6 +1233,7 @@ class LadderPanel extends HTMLElement {
     return `<div data-elid="${el.id}">
       <div class="phead"><b>${esc(el.type)}</b> <span class="muted">${esc(DESCR[el.type] || "")}</span><button class="mini" data-pact="close">✕</button></div>
       ${err ? `<div class="errbox">⚠ ${esc(err)}</div>` : ""}
+      ${(() => { const w = this._analyze().elWarn.get(el.id); return w && !err ? `<div class="errbox ${w.level}">${w.level === "error" ? "⛔" : "⚠"} ${esc(w.msg)}</div>` : ""; })()}
       ${rows || `<p class="muted">No settings.</p>`}
       <div class="acts">
         <button class="mini" data-pact="left" title="Alt+←">◀ Move</button>
@@ -1199,6 +1241,7 @@ class LadderPanel extends HTMLElement {
         ${inOut === "logic" ? `<button class="mini" data-pact="or" title="Add a parallel branch around this">OR branch</button>` : ""}
         <button class="mini danger" data-pact="del" title="Delete">Delete</button>
       </div>
+      ${this._xrefHtml([el.tag, el.a, el.b, el.src, el.dst, el.reset, el.load, el.cd, ...(el.name && (TIMER_TYPES.has(el.type) || COUNTER_TYPES.has(el.type)) ? [`#${el.name}.Q`, TIMER_TYPES.has(el.type) ? `#${el.name}.ET` : `#${el.name}.CV`] : [])])}
       <p class="help">Operands: ${esc(OPERAND_HELP)}</p></div>`;
   }
   /* ---------- entity / action picker ---------- */
@@ -1469,18 +1512,21 @@ class LadderPanel extends HTMLElement {
       if (live) live.innerHTML = this._operandChip(t.value);
       if (t.dataset.pick && e.type === "input" && !e.detail?.fromPicker) this._pickFilter(t);
     } else return;
+    this._anGen = (this._anGen || 0) + 1;
     this._commitSnap();
     this._setDirty(true);
     this._renderToolbar();
     this._updateSvgs();
   }
   _propClick(e) {
+    const gt = e.target.closest("[data-goto]");
+    if (gt) { this._goto(gt.dataset.goto, +gt.dataset.gpi); return; }
     const po = e.target.closest("[data-pickopen]");
     if (po) { const inp = this.shadowRoot.querySelector(`#props [data-field="${po.dataset.pickopen}"]`); if (inp) { if (this._pick && this._pick.input === inp) this._pickClose(); else { inp.focus(); this._pickOpen(inp, true); } } return; }
     const b = e.target.closest("[data-pact]");
     if (b) {
       switch (b.dataset.pact) {
-        case "close": this.sel = this.sel ? { rung: this.sel.rung, ids: [] } : null; this._updateSvgs(); this._renderProps(); break;
+        case "close": this._showChecks = false; this.sel = this.sel ? { rung: this.sel.rung, ids: [] } : null; this._updateSvgs(); this._renderProps(); break;
         case "del": this._delete(); break;
         case "or": this._wrapOr(); break;
         case "left": this._move(-1); break;
@@ -1523,6 +1569,7 @@ class LadderPanel extends HTMLElement {
         <tr><td>Errors</td><td>${s.errors ?? 0}</td></tr>
         <tr><td>Cycle</td><td><input id="scanms" type="number" min="50" max="10000" step="50" value="${esc(this.settings.scan_ms)}" class="num"> ms <button class="mini" data-pact="scan">Set</button></td></tr>
       </table>
+      ${mon.simulate || (mon.simlog || []).length ? `<div class="wtitle">🧪 Simulated (${mon.simulate ? "test mode on" : "last test"})</div>${(mon.simlog || []).length ? `<table class="kv simlog">${[...mon.simlog].reverse().slice(0, 15).map((x) => `<tr><td class="mono">${esc(new Date(x.t * 1000).toLocaleTimeString([], { hour12: false }))}</td><td>${x.kind === "action" ? "▶ " : ""}<span class="mono">${esc(x.target)}</span> ${x.kind === "output" ? "→ <b>" + esc(fmtVal(x.value)) + "</b>" : `<span class="muted">${esc(trunc(JSON.stringify(x.value), 60))}</span>`}</td></tr>`).join("")}</table>` : `<p class="muted">No simulated outputs or actions yet.</p>`}` : ""}
       <div class="wtitle">Markers</div>
       ${memRows ? `<table class="kv">${memRows}</table>` : `<p class="muted">None yet — write to <span class="mono">#name</span> with a coil.</p>`}
       ${tRows ? `<div class="wtitle">Timers</div><table class="kv">${tRows}</table>` : ""}
@@ -1544,6 +1591,149 @@ class LadderPanel extends HTMLElement {
       if (f && !this._narrow) f.focus();
     });
   }
+
+  async _toggleTest() {
+    const on = !(this.mon && this.mon.simulate);
+    if (!on && !confirm("Leave test mode?\n\nOn the next scan the program's outputs are applied to the real devices.")) return;
+    try {
+      await this._hass.callWS({ type: "ha_ladder/simulate", enabled: on });
+      this._toast(on ? "Test mode on — nothing will be switched" : "Test mode off — outputs are live");
+    } catch (e) { this._toast(String(e.message || e), true); }
+  }
+
+  /* ---------- cross-reference & checks ---------- */
+  _analyze() {
+    // cheap cache key: bumped on every edit, plus entity count, forces and a 5 s clock (for unavailable entities)
+    const key = `${this._anGen || 0}:${this.pi}:${Object.keys(this._hass.states).length}:${Object.keys((this.mon && this.mon.forces) || {}).join(",")}:${Math.floor(Date.now() / 5000)}`;
+    if (this._an && this._an.key === key) return this._an;
+    const uses = new Map(); // tag -> [{pi, ri, rung, id, type, acc}]
+    const timers = new Map(); // timer/counter name -> [{...}]
+    const problems = [];
+    const elWarn = new Map();
+    const add = (tag, u) => { tag = String(tag ?? "").trim(); if (!tag || !/^(#|[a-z_0-9]+\.[a-z0-9_]+)/.test(tag)) return; if (!uses.has(tag)) uses.set(tag, []); uses.get(tag).push(u); };
+    const st = this._hass.states;
+    const flag = (level, msg, refs) => {
+      problems.push({ level, msg, refs });
+      for (const r of refs) if (!elWarn.has(r.id) || level === "error") elWarn.set(r.id, { level, msg });
+    };
+    this.programs.forEach((p, pi) => p.rungs.forEach((r, ri) => {
+      const where = `${this.programs.length > 1 ? p.name + " · " : ""}R${ri + 1}`;
+      const scan = (n) => {
+        const base = { pi, ri, rung: r.id, id: n.id, type: n.type, where, active: p.enabled && r.enabled };
+        for (const k of ["tag", "a", "b", "src", "dst", "reset", "load", "cd", "pt", "pv", "min", "max", "in_min", "in_max", "out_min", "out_max", "entity"]) {
+          const v = n[k]; if (typeof v !== "string" || !v.trim()) continue;
+          let acc = "R";
+          if (k === "tag" && COIL_TYPES.has(n.type)) acc = n.type === "SET" ? "S" : n.type === "RESET" ? "R0" : "W";
+          if (k === "dst") acc = "W";
+          if (k === "entity") acc = "A";
+          for (const part of k === "entity" ? v.split(",") : [v]) add(part, { ...base, acc, field: k });
+        }
+        if (n.name && (TIMER_TYPES.has(n.type) || COUNTER_TYPES.has(n.type))) {
+          const nm = n.name.trim();
+          if (!timers.has(nm)) timers.set(nm, []);
+          timers.get(nm).push(base);
+        }
+        const need = CONTACT_TYPES.has(n.type) || COIL_TYPES.has(n.type) ? ["tag"] : ["MOVE", "MATH", "SCALE"].includes(n.type) ? ["dst"] : ["SVC", "NOTIFY"].includes(n.type) ? ["service"] : TIMER_TYPES.has(n.type) || COUNTER_TYPES.has(n.type) ? ["name"] : n.type === "CMP" ? ["a", "b"] : [];
+        for (const k of need) if (!String(n[k] ?? "").trim()) flag("warn", `${where} ${n.type}: ${k === "tag" ? "no tag" : k + " is empty"}`, [base]);
+        if (n.type === "SVC" && n.data) { try { JSON.parse(n.data); } catch (e) { flag("error", `${where} SERVICE: data is not valid JSON`, [base]); } }
+      };
+      walk(r.logic, (n) => n.t === "el" && scan(n));
+      r.outputs.forEach((o) => scan(o));
+      if (!r.outputs.length && r.logic.items.length) problems.push({ level: "info", msg: `${where}: rung has no outputs`, refs: [{ pi, rung: r.id, id: r.id, where }] });
+    }));
+    for (const [tag, us] of uses) {
+      const act = us.filter((u) => u.active);
+      const assign = act.filter((u) => u.acc === "W");
+      const setres = act.filter((u) => u.acc === "S" || u.acc === "R0");
+      if (assign.length > 1) flag("warn", `${tag} is written by ${assign.length} coils/moves (${assign.map((u) => u.where).join(", ")}) — the last one in the scan wins`, assign);
+      else if (assign.length && setres.length) flag("warn", `${tag} is both assigned (${assign[0].where}) and set/reset (${setres.map((u) => u.where).join(", ")})`, [...assign, ...setres]);
+      if (act.some((u) => u.acc === "S") && !act.some((u) => u.acc === "R0") && !assign.length) problems.push({ level: "info", msg: `${tag} is SET but never RESET (stays latched)`, refs: act.filter((u) => u.acc === "S") });
+      const ent = tag.replace(/\[.*$/, "");
+      if (!tag.startsWith("#")) {
+        if (!st[ent]) flag("error", `${tag}: entity not found`, us);
+        else {
+          const d = ent.split(".")[0];
+          const w = us.filter((u) => u.acc === "W" || u.acc === "S" || u.acc === "R0");
+          if (w.length && READ_ONLY.has(d)) flag("error", `${tag} is read-only and can't be written`, w);
+          else if (w.length && tag.includes("[")) flag("error", `${tag}: attributes can't be written`, w);
+          if (["unavailable", "unknown"].includes(st[ent].state)) flag("warn", `${tag} is ${st[ent].state} right now`, us);
+        }
+      } else {
+        const m = /^#(.*)\.(Q|ET|CV)$/i.exec(tag);
+        if (m) {
+          if (!timers.has(m[1]) && us.some((u) => u.acc === "R")) flag("warn", `${tag}: no timer or counter named ${m[1]}`, us.filter((u) => u.acc === "R"));
+        } else if (!us.some((u) => u.acc !== "R") && !(this.mon && this.mon.forces && tag in this.mon.forces)) {
+          problems.push({ level: "info", msg: `${tag} is read but never written by the program`, refs: us });
+        }
+      }
+    }
+    for (const [nm, defs] of timers) if (defs.length > 1) flag("error", `Timer/counter name ${nm} is used by ${defs.length} blocks (${defs.map((d) => d.where).join(", ")}) — each needs its own name`, defs);
+    const order = { error: 0, warn: 1, info: 2 };
+    problems.sort((a, b) => order[a.level] - order[b.level]);
+    this._an = { key, uses, timers, problems, elWarn };
+    return this._an;
+  }
+  _xrefHtml(tags) {
+    const an = this._analyze();
+    const acc = { R: "read", W: "write", S: "set", R0: "reset", A: "target" };
+    const seen = new Set();
+    const blocks = tags.map((t) => {
+      t = String(t ?? "").trim(); if (!t || seen.has(t)) return ""; seen.add(t);
+      const us = an.uses.get(t) || [];
+      const m = /^#(.*)\.(Q|ET|CV)$/i.exec(t);
+      const defs = m ? an.timers.get(m[1]) || [] : [];
+      if (!us.length && !defs.length) return "";
+      return `<div class="xref"><div class="xtag mono">${esc(t)} <span class="muted">· ${us.length} use${us.length === 1 ? "" : "s"}</span></div>
+        ${[...defs.map((d) => ({ ...d, acc: "D" })), ...us].map((u) => `<button class="xrow" data-goto="${esc(u.id)}" data-gpi="${u.pi}"><span class="acc a${u.acc}">${u.acc === "D" ? "def" : acc[u.acc]}</span><span class="mono">${esc(u.where)}</span> ${esc(u.type)}${u.active ? "" : ` <span class="muted">(disabled)</span>`}</button>`).join("")}</div>`;
+    }).join("");
+    return blocks ? `<div class="wtitle">Cross-reference</div>${blocks}` : "";
+  }
+  _checksHtml() {
+    const an = this._analyze();
+    const icon = { error: "⛔", warn: "⚠", info: "ℹ" };
+    return `<div class="phead"><b>Checks</b><span class="muted">${an.problems.filter((p) => p.level !== "info").length} to look at</span><button class="mini" data-pact="close">✕</button></div>
+      ${an.problems.length ? an.problems.map((p) => `<div class="prob ${p.level}"><span>${icon[p.level]}</span><div>${esc(p.msg)}<div>${p.refs.slice(0, 6).map((r) => `<button class="uchip" data-goto="${esc(r.id)}" data-gpi="${r.pi}">${esc(r.where || "rung")}</button>`).join("")}</div></div></div>`).join("") : `<p class="muted">✓ No problems found.</p>`}
+      <p class="help">Checks: double coils, assign + set/reset on the same tag, duplicate timer/counter names, references to missing timers/counters, missing, unavailable or read-only entities, empty operands, invalid JSON.</p>`;
+  }
+  _goto(id, pi) {
+    if (pi !== undefined && !isNaN(pi)) this.pi = pi;
+    const loc = this._locate(id);
+    const rung = loc ? loc.rung : this.prog.rungs.find((r) => r.id === id);
+    if (!rung) return;
+    if (this._collapsed.delete(rung.id)) this._saveCollapsed();
+    this.sel = { rung: rung.id, ids: loc ? [id] : [] };
+    this._showChecks = false;
+    if (this.view !== "ladder") this._setView("ladder"); else this._render();
+    requestAnimationFrame(() => { const g = this.shadowRoot.querySelector(`[data-id="${id}"]`) || this.shadowRoot.querySelector(`[data-rung="${rung.id}"]`); if (g) g.scrollIntoView({ block: "center", behavior: "smooth" }); });
+  }
+
+  _rungSummary(r) {
+    const names = (n) => {
+      const out = [];
+      walk(n, (x) => { if (x.t === "el") out.push(x); });
+      return out;
+    };
+    const conds = names(r.logic);
+    const lbl = (el) => {
+      const t = el.tag || el.dst || el.name || el.service || el.a || "";
+      const L = t ? this._label(t) : { main: el.type };
+      return `${el.type}${t ? " " + trunc(L.main, 22) : ""}`;
+    };
+    const left = conds.length ? conds.slice(0, 4).map(lbl).join(" · ") + (conds.length > 4 ? ` · +${conds.length - 4}` : "") : "always";
+    const right = r.outputs.length ? r.outputs.map(lbl).join(", ") : "no outputs";
+    return `<span class="muted">${esc(left)}</span> <b>→</b> ${esc(right)}`;
+  }
+  _toggleCollapse(id) {
+    this._collapsed.has(id) ? this._collapsed.delete(id) : this._collapsed.add(id);
+    this._saveCollapsed();
+    this._renderCanvas();
+  }
+  _collapseAll(on) {
+    for (const r of this.prog.rungs) on ? this._collapsed.add(r.id) : this._collapsed.delete(r.id);
+    this._saveCollapsed();
+    this._renderCanvas();
+  }
+  _saveCollapsed() { try { localStorage.setItem("ha_ladder_collapsed", JSON.stringify([...this._collapsed].slice(-500))); } catch (e) { /* ignore */ } }
 
   /* ---------- views ---------- */
   _setView(v) {
@@ -1602,12 +1792,13 @@ class LadderPanel extends HTMLElement {
     this.programs.forEach((p, pi) => p.rungs.forEach((r, ri) => {
       const scan = (n) => {
         const use = { pi, rung: r.id, id: n.id, label: `${this.programs.length > 1 ? p.name + " · " : ""}R${ri + 1} ${n.type}` };
+        const ulabel = (k) => ({ ...use, label: ((k === "tag" && COIL_TYPES.has(n.type)) || k === "dst" ? "✎ " : "") + use.label });
         for (const k of ["tag", "a", "b", "src", "dst", "reset", "load", "cd", "pt", "pv", "min", "max", "in_min", "in_max", "out_min", "out_max"]) {
           const v = n[k]; if (typeof v !== "string" || !v.trim()) continue;
           const isOut = (k === "tag" && COIL_TYPES.has(n.type)) || k === "dst";
           const tag = v.trim();
           const kind = tag.startsWith("#") ? (/\.(Q|ET)$/i.test(tag) ? "timer" : /\.CV$/i.test(tag) ? "counter" : "marker") : isOut ? "output" : "input";
-          add(tag, kind, use);
+          add(tag, kind, ulabel(k));
         }
         if (n.name && TIMER_TYPES.has(n.type)) { add(`#${n.name}.Q`, "timer", use); add(`#${n.name}.ET`, "timer", use); }
         if (n.name && COUNTER_TYPES.has(n.type)) { add(`#${n.name}.CV`, "counter", use); add(`#${n.name}.Q`, "counter", use); }
@@ -1630,6 +1821,7 @@ class LadderPanel extends HTMLElement {
     // typed value for a tag: bool / number / string / null
     const mon = this.mon || {};
     if (mon.forces && tag in mon.forces) return mon.forces[tag];
+    if (mon.simulate && mon.sim && tag in mon.sim) return mon.sim[tag];
     if (tag.startsWith("#")) {
       const n = tag.slice(1), m = /^(.*)\.(Q|ET|CV)$/i.exec(n);
       if (m) {
@@ -2119,14 +2311,15 @@ class LadderPanel extends HTMLElement {
       this._renderToolbar();
       if (this.view === "tags") { this._tagsUpdate(); return; }
       if (this.view === "trace") { this._traceLegendUpdate(); this._traceDraw(); return; }
-      if (this._wasRunning !== !!(this.mon && this.mon.running)) {
-        this._wasRunning = !!(this.mon && this.mon.running);
+      const modeKey = `${!!(this.mon && this.mon.running)}/${!!(this.mon && this.mon.simulate)}`;
+      if (this._wasRunning !== modeKey) {
+        this._wasRunning = modeKey;
         this._renderCanvas();
       } else this._updateSvgs();
       const props = this.shadowRoot.getElementById("props");
       const focused = this.shadowRoot.activeElement;
       if (!(this.sel && this.sel.ids.length)) {
-        if (!(focused && props.contains(focused))) props.innerHTML = this._watch();
+        if (!(focused && props.contains(focused))) props.innerHTML = this._showChecks ? this._checksHtml() : this._watch();
       } else {
         props.querySelectorAll("[data-live]").forEach((d) => {
           const inp = props.querySelector(`[data-field="${d.dataset.live}"]`);
@@ -2259,6 +2452,38 @@ table.tags .empty { text-align: center; padding: 30px; }
 :host([narrow]) table.tags td:nth-child(9) { grid-column: 3; grid-row: 3; text-align: right; }
 :host([narrow]) table.tags td:nth-child(6):has(> .muted:only-child) { display: none; }
 :host([narrow]) .addwatch { min-width: 0; width: 100%; }
+.tb.test { background: #8b5cf6; border-color: #8b5cf6; color: #fff; font-weight: 700; }
+.tb#checks { color: #d97706; border-color: #f59e0b; font-weight: 700; }
+.tb#checks.bad { color: #fff; background: var(--err); border-color: var(--err); }
+.banner.test { background: rgba(139,92,246,.14); border-color: rgba(139,92,246,.5); }
+.banner .mini { margin-left: 8px; }
+.val.sval { fill: #8b5cf6; }
+.simlog td { font-size: 11.5px; }
+.chev { border: 0; background: transparent; color: var(--muted); font-size: 13px; width: 20px; padding: 0; }
+.chev:hover { color: var(--accent); }
+.rled { width: 9px; height: 9px; border-radius: 50%; background: var(--line); flex: none; }
+.rled.on { background: var(--on); box-shadow: 0 0 6px var(--on); }
+.rled.off { background: var(--off); }
+.rsummary { display: none; padding: 6px 14px 8px 46px; font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rung.collapsed .rsummary { display: block; }
+.rung.collapsed .svgwrap { display: none; }
+.rung.collapsed .rhead { border-bottom: 0; }
+.el.warn-warn .hit { stroke: #f59e0b; stroke-width: 1.5; stroke-dasharray: 4 3; }
+.el.warn-error .hit { stroke: var(--err); stroke-width: 1.8; stroke-dasharray: 2 2; }
+.errbox.warn { background: rgba(245,158,11,.12); color: #b45309; }
+:host([data-theme="dark"]) .errbox.warn { color: #fbbf24; }
+.xref { border: 1px solid var(--line); border-radius: 8px; margin-bottom: 6px; overflow: hidden; }
+.xtag { padding: 5px 8px; font-size: 12px; font-weight: 600; background: var(--bg); border-bottom: 1px solid var(--line); }
+.xrow { display: flex; gap: 8px; align-items: center; width: 100%; text-align: left; border: 0; background: transparent; padding: 4px 8px; font-size: 12px; }
+.xrow:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.acc { font: 700 9.5px system-ui; text-transform: uppercase; border-radius: 4px; padding: 1px 5px; min-width: 38px; text-align: center; background: var(--bg); border: 1px solid var(--line); color: var(--muted); }
+.acc.aW, .acc.aS, .acc.aR0 { background: #f59e0b; border-color: #f59e0b; color: #1b1300; }
+.acc.aD { background: var(--accent); border-color: var(--accent); color: #fff; }
+.acc.aA { background: #8b5cf6; border-color: #8b5cf6; color: #fff; }
+.prob { display: flex; gap: 8px; padding: 8px; border-radius: 8px; margin-bottom: 6px; font-size: 12.5px; background: var(--bg); border: 1px solid var(--line); }
+.prob.error { border-color: var(--err); }
+.prob.warn { border-color: #f59e0b; }
+.prob .uchip { margin-top: 4px; }
 .chartbox canvas { position: absolute; left: 0; top: 0; display: block; touch-action: none; cursor: crosshair; }
 .charthint { position: absolute; right: 10px; top: 6px; font-size: 10.5px; color: var(--muted); pointer-events: none; }
 :host([narrow]) .tracewrap { grid-template-columns: 1fr; grid-template-rows: auto 60vh; height: auto; }

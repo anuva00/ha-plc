@@ -17,7 +17,7 @@ def _ctrl(hass: HomeAssistant):
 
 @callback
 def async_register_websocket(hass: HomeAssistant) -> None:
-    for cmd in (ws_get, ws_save, ws_run, ws_settings, ws_monitor, ws_set_memory, ws_force, ws_unforce, ws_trace_set, ws_trace_get):
+    for cmd in (ws_get, ws_save, ws_run, ws_settings, ws_monitor, ws_set_memory, ws_force, ws_unforce, ws_trace_set, ws_trace_get, ws_simulate):
         websocket_api.async_register_command(hass, cmd)
 
 
@@ -159,3 +159,14 @@ def ws_trace_get(hass, connection, msg) -> None:
     if c is None:
         return _not_ready(connection, msg)
     connection.send_result(msg["id"], c.trace_data())
+
+
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/simulate", vol.Required("enabled"): bool})
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_simulate(hass, connection, msg) -> None:
+    c = _ctrl(hass)
+    if c is None:
+        return _not_ready(connection, msg)
+    await c.async_set_simulate(msg["enabled"])
+    connection.send_result(msg["id"], {"simulate": c.simulate})

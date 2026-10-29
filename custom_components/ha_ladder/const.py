@@ -1,6 +1,6 @@
 """Constants for the Ladder Logic integration."""
 DOMAIN = "ha_ladder"
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 PANEL_URL = "ha-ladder"
 PANEL_ELEMENT = "ha-ladder-panel"
 STATIC_URL = "/ha_ladder_static"

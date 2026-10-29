@@ -52,6 +52,27 @@ lock lock/unlock, scene/button activate, vacuum start/dock, lawn_mower mow/dock.
 Numbers written with MOVE/MATH: input_number/number value, light brightness %,
 cover position, fan %, climate setpoint, media_player volume (0–1).
 
+## Test mode
+🧪 **Test** in the toolbar (or `switch.ladder_logic_plc_test_mode`) runs the program normally, but outputs and actions are only simulated: nothing in the house is switched and no notifications are sent. Simulated outputs read back to the program (so latches work), show in purple as "(sim)" in the ladder and on the Tags/Trace pages, and the Watch panel lists every simulated output change and action. When you leave test mode, the next scan applies the program's outputs to the real devices.
+
+## Checks and cross-reference
+The ⚠ badge in the toolbar counts problems; click it for the list, with links to each place:
+* **double coils**: the same tag assigned by two coils/moves (the last one wins each scan), or assigned *and* set/reset;
+* duplicate timer/counter names; references to a timer/counter that doesn't exist;
+* missing, unavailable or read-only entities, writing to attributes, empty operands, invalid JSON;
+* info: SET without RESET, markers that are read but never written, rungs without outputs.
+
+Affected elements get a dashed outline. Selecting an element shows a **cross-reference** of every tag it uses: each use with read/write/set/reset/definition badges, and a click jumps there.
+
+## Collapsible rungs
+▾/▸ on each rung collapses it to a one-line summary (`NO Hallway Motion · SUN → COIL Hallway Light`), with a status LED that shows the rung result while monitoring. ⊟/⊞ collapse/expand all. Collapse state is remembered per browser and doesn't mark the program as changed.
+
+## Scan semantics (worth knowing)
+* Edge contacts, P_TRIG/N_TRIG, edge coils, counters and SERVICE/NOTIFY only see an edge if they were also evaluated in the previous scan. A rung that is newly added, re-enabled or just started never fires a false edge.
+* Non-retentive timers that weren't evaluated last scan (rung disabled, PLC stopped) start fresh instead of jumping by the skipped time. TP doesn't fire on the first scan if its input is already on.
+* STOP → RUN clears edge memory and timers and re-syncs every output to the logic on the first scan. An output that was unavailable is re-synced when it comes back.
+* The last write in a scan wins. Reading an entity that a coil wrote earlier in the same scan returns the written value (output image).
+
 ## Entity picker
 Operand fields have a searchable picker. Search by name, entity id, area or device. Suggestions depend on the field: a contact suggests on/off sources, a coil only switchable entities, a MOVE destination only settable ones. Domain chips filter the list; recently used and in-program entities come first, with live state shown. After you pick an entity you can choose one of its attributes, e.g. `climate.living[current_temperature]`. You can also enter `#markers` or constants. Keyboard: ↑ ↓ Enter Esc.
 

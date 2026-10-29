@@ -32,6 +32,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
+from collections import deque
 from typing import Any, Callable, Protocol
 
 TRUE_STATES = {
@@ -186,8 +187,9 @@ class TimerState:
     start: float = 0.0
     et: float = 0.0
     q: bool = False
-    prev_in: bool = False
+    prev_in: bool | None = None  # None = not evaluated yet (no edge on first call)
     last: float | None = None  # TONR accumulation
+    scan: int = -1  # scan number of the last evaluation
 
 
 @dataclass
@@ -223,6 +225,11 @@ class Runtime:
         self.last_cmd: dict[str, Any] = {}  # entity -> last commanded value
         self.last_write: dict[str, float] = {}
         self.pending: dict[str, tuple[Any, float]] = {}
+        self.unavailable: set[str] = set()  # outputs that were unavailable; resync when they return
+        # test mode: outputs and actions are simulated, nothing reaches HA
+        self.simulate = False
+        self.sim: dict[str, Any] = {}
+        self.simlog: deque = deque(maxlen=60)
         self.monitor: dict[str, list] = {}
         self.errors: dict[str, str] = {}
         self.stats = ScanStats()
@@ -262,6 +269,29 @@ class Runtime:
             self.forces.pop(self.force_key(raw) or "", None)
         self.dirty = True
 
+    def reset_transients(self) -> None:
+        """STOP -> RUN: forget edge memory, non-retentive timers and the output
+        history, so the first scan starts clean and re-syncs every output."""
+        self.edges.clear()
+        self.timers.clear()
+        self.last_cmd.clear()
+        self.pending.clear()
+        self.unavailable.clear()
+        self.image = {}
+
+    def set_simulate(self, on: bool) -> None:
+        if on == self.simulate:
+            return
+        self.simulate = on
+        self.sim.clear()
+        # either way, outputs re-sync on the next scan (real devices when leaving test mode)
+        self.last_cmd.clear()
+        self.pending.clear()
+
+    def _log_sim(self, kind: str, target: str, value: Any) -> None:
+        ts = self._now.timestamp() if self._now else 0
+        self.simlog.append({"t": round(ts, 3), "kind": kind, "target": target, "value": value})
+
     def load(self, programs: list[dict]) -> None:
         self.programs = programs
         self.monitor = {}
@@ -295,10 +325,12 @@ class Runtime:
         # pending command read-back (output image), see SETTLE_SECONDS
         if op.ref in self.image:
             return self.image[op.ref].value
+        if self.simulate and op.ref in self.sim:
+            return self.sim[op.ref]
         pend = self.pending.get(op.ref)
         if pend is not None:
             val, t = pend
-            if self._now_mono - t < SETTLE_SECONDS and not _state_matches(op.ref, state, val):
+            if self._now_mono - t < SETTLE_SECONDS and not _state_matches(op.ref, state, val, attrs):
                 return val
             self.pending.pop(op.ref, None)
         if state in UNAVAILABLE:
@@ -359,13 +391,31 @@ class Runtime:
         for key, val in self.forces.items():
             if key in self.last_cmd and key not in self.image:
                 self.image[key] = OutputCmd(val)
+        if self.simulate:
+            for entity, cmd in self.image.items():
+                prev = self.sim[entity] if entity in self.sim else None
+                if entity not in self.sim or not _same(prev, cmd.value):
+                    state, attrs = self.io.get(entity)
+                    if entity in self.sim or not _state_matches(entity, state, cmd.value, attrs):
+                        self._log_sim("output", entity, cmd.value)
+                self.sim[entity] = cmd.value
+            self.image = {}
+            return
+        # drop read-back entries that have settled or expired (entities the program never reads)
+        for entity in [e for e, (val, t) in self.pending.items() if self._now_mono - t >= SETTLE_SECONDS]:
+            self.pending.pop(entity, None)
         for entity, cmd in self.image.items():
             state, attrs = self.io.get(entity)
             if state in UNAVAILABLE:
+                self.unavailable.add(entity)
                 continue
             new = cmd.value
             matches = _state_matches(entity, state, new, attrs)
-            if entity not in self.last_cmd:
+            if entity in self.pending and matches:
+                self.pending.pop(entity, None)
+            if entity not in self.last_cmd or entity in self.unavailable:
+                # first write, or the device just came back: sync it to the logic
+                self.unavailable.discard(entity)
                 need = not matches
             elif not _same(self.last_cmd[entity], new):
                 need = True
@@ -385,6 +435,7 @@ class Runtime:
                     self.errors[entity] = str(err)
                     self.stats.errors += 1
                     continue
+                self.errors.pop(entity, None)
                 self.last_write[entity] = self._now_mono
                 self.pending[entity] = (new, self._now_mono)
                 if self.on_write:
@@ -408,6 +459,7 @@ class Runtime:
                     power = self._eval(rung.get("logic"), True)
                     for out in rung.get("outputs", []):
                         self._eval(out, power)
+                    self.errors.pop(rung.get("id", "?"), None)
                 except Exception as err:  # noqa: BLE001 - keep scanning other rungs
                     self.errors[rung.get("id", "?")] = str(err)
                     self.stats.errors += 1
@@ -451,8 +503,15 @@ class Runtime:
 
     # -- elements -------------------------------------------------------------
     def _edge(self, key: str, cur: Any) -> Any:
-        prev = self.edges.get(key, cur)
-        self.edges[key] = cur
+        """Previous value for edge detection. If the element wasn't evaluated in
+        the previous scan (new, rung/program just enabled, PLC just started) the
+        previous value is taken to be the current one, so no false edge fires."""
+        n = self.stats.count
+        rec = self.edges.get(key)
+        prev = rec[0] if rec is not None and rec[1] == n - 1 else cur
+        if rec is not None and rec[1] == n:  # evaluated twice in one scan (duplicate id)
+            prev = rec[2]
+        self.edges[key] = (cur, n, prev)
         return prev
 
     def _element(self, el: dict, pi: bool) -> tuple[bool, Any]:
@@ -558,7 +617,15 @@ class Runtime:
         typ = el["type"]
         name = (el.get("name") or el.get("id") or "").strip()
         pt = max(0.0, to_number(self.read(el.get("pt"))) or 0.0)
-        ts = self.timers.setdefault(name, TimerState())
+        ts = self.timers.get(name)
+        n = self.stats.count
+        if ts is None or (ts.scan < n - 1 and typ != "TONR"):
+            # new timer, or it wasn't called last scan (rung was disabled, PLC restarted):
+            # start from a clean state instead of jumping by the time it was skipped
+            ts = self.timers[name] = TimerState()
+        ts.scan = n
+        if ts.prev_in is None:
+            ts.prev_in = pi
         if typ == "TON":
             if pi:
                 if not ts.running:
@@ -662,6 +729,9 @@ class Runtime:
         if "." not in svc:
             raise ValueError(f"service must be domain.service, got {svc!r}")
         domain, service = svc.split(".", 1)
+        if self.simulate:
+            self._log_sim("action", svc, data)
+            return
         self.io.call(domain, service, data)
 
 
@@ -889,9 +959,27 @@ def validate_programs(programs: Any) -> list[dict]:
         else:
             raise ValueError(f"{where}: bad node type {t!r}")
 
+    seen: set[str] = set()
+
+    def ids(node: Any) -> None:
+        if isinstance(node, dict):
+            i = node.get("id")
+            if i in seen:
+                raise ValueError(f"duplicate element id {i!r} (re-import the program)")
+            seen.add(i)
+            for x in node.get("items", []) or []:
+                ids(x)
+            for x in node.get("branches", []) or []:
+                ids(x)
+
     for p in programs:
         if not isinstance(p, dict) or not p.get("id"):
             raise ValueError("program needs an id")
+        for r in p.get("rungs", []):
+            ids(r.get("logic"))
+            for o in r.get("outputs", []):
+                ids(o)
+    for p in programs:
         for ri, r in enumerate(p.get("rungs", [])):
             where = f"{p.get('name', p['id'])} rung {ri + 1}"
             if r.get("logic") is not None:

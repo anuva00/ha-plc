@@ -90,6 +90,7 @@ class LadderController:
         retain = await self._retain_store.async_load() or {}
         self.runtime = Runtime(HassIO(self.hass), retain)
         self.runtime.load(self.programs)
+        self.runtime.simulate = bool(self.settings.get("simulate", False))
         self._trace_config(self.settings.get("trace") or [])
 
     @property
@@ -100,6 +101,8 @@ class LadderController:
     def async_start(self) -> None:
         if self._unsub_timer is not None:
             return
+        # STOP -> RUN: clean edges/timers and re-sync outputs on the first scan
+        self.runtime.reset_transients()
         ms = int(min(MAX_SCAN_MS, max(MIN_SCAN_MS, self.settings.get("scan_ms", DEFAULT_SCAN_MS))))
         self._unsub_timer = async_track_time_interval(
             self.hass, self._scan, timedelta(milliseconds=ms), name="ha_ladder scan", cancel_on_shutdown=True
@@ -119,6 +122,18 @@ class LadderController:
         self.async_stop()
         if self.runtime:
             await self._retain_store.async_save(self.runtime.retain_data())
+
+    async def async_set_simulate(self, on: bool) -> None:
+        self.runtime.set_simulate(on)
+        self.settings["simulate"] = on
+        await self._save()
+        _LOGGER.info("Ladder: test mode %s", "on" if on else "off")
+        self._notify_listeners()
+        self._push(force=True)
+
+    @property
+    def simulate(self) -> bool:
+        return self.runtime.simulate
 
     async def async_set_running(self, running: bool) -> None:
         self.settings["running"] = running
@@ -253,6 +268,9 @@ class LadderController:
             "mem": {k: v for k, v in rt.memory.items() if isinstance(v, (bool, int, float, str)) or v is None},
             "ctr": rt.counters,
             "forces": rt.forces,
+            "simulate": rt.simulate,
+            "sim": {k: v for k, v in rt.sim.items()} if rt.simulate else {},
+            "simlog": list(rt.simlog)[-30:],
             "trace": self._take_trace_pending(),
             "tmr": {k: {"q": t.q, "et": round(t.et, 2)} for k, t in rt.timers.items()},
             "stats": {

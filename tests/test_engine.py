@@ -109,13 +109,15 @@ def test_seal_in_does_not_flicker(io):
 
 
 def test_ton_tof_tp(io):
-    io.set("binary_sensor.m", "on")
+    io.set("binary_sensor.m", "off")
     rt = E.Runtime(io)
     rt.load(prog(
         (S(el("NO", tag="binary_sensor.m"), el("TON", name="T1", pt=5)), [el("COIL", tag="#ton")]),
         (S(el("NO", tag="binary_sensor.m"), el("TOF", name="T2", pt=3)), [el("COIL", tag="#tof")]),
         (S(el("NO", tag="binary_sensor.m"), el("TP", name="T3", pt=2)), [el("COIL", tag="#tp")]),
     ))
+    rt.scan()
+    io.set("binary_sensor.m", "on")
     rt.scan()
     assert rt.memory == {"ton": False, "tof": True, "tp": True}
     io.t += 2.5; rt.scan()
@@ -284,3 +286,138 @@ def test_forces(io):
     assert io.calls[-1][1] == "turn_off" and rt.memory["m"] is False  # btn really off again
     rt2 = E.Runtime(io, {"forces": {"#x": 5}})
     assert rt2.read("#x") == 5
+
+
+# ---------------------------------------------------------------- audit fixes
+def test_enforce_retries_when_output_is_never_read(io):
+    io.set("switch.pump", "off")
+    calls = []
+    io.call = lambda d, s, data: calls.append(s)  # device ignores commands
+    rt = E.Runtime(io)
+    rt.load(prog((S(), [el("COIL", tag="switch.pump", enforce=True)])))
+    rt.scan()
+    assert calls == ["turn_on"]
+    for _ in range(30):
+        io.t += 0.25; rt.scan()
+    assert calls.count("turn_on") >= 2  # retried after the settle window
+
+
+def test_no_false_edge_when_rung_reenabled(io):
+    io.set("binary_sensor.b", "off")
+    rt = E.Runtime(io)
+    p = prog((S(el("P", tag="binary_sensor.b")), [el("PCOIL", tag="#pulse"), el("CTU", name="C", pv=5)]))
+    rt.load(p)
+    rt.scan()
+    p[0]["rungs"][0]["enabled"] = False
+    rt.scan()
+    io.set("binary_sensor.b", "on")  # changes while the rung is disabled
+    rt.scan()
+    p[0]["rungs"][0]["enabled"] = True
+    rt.scan()
+    assert rt.memory["pulse"] is False and rt.counters["C"]["cv"] == 0
+    io.set("binary_sensor.b", "off"); rt.scan()
+    io.set("binary_sensor.b", "on"); rt.scan()
+    assert rt.memory["pulse"] is True and rt.counters["C"]["cv"] == 1
+
+
+def test_tp_does_not_fire_on_first_scan(io):
+    io.set("binary_sensor.b", "on")
+    rt = E.Runtime(io)
+    rt.load(prog((S(el("NO", tag="binary_sensor.b"), el("TP", name="T", pt=5)), [el("COIL", tag="#q")])))
+    rt.scan()
+    assert rt.memory["q"] is False
+    io.set("binary_sensor.b", "off"); rt.scan()
+    io.set("binary_sensor.b", "on"); rt.scan()
+    assert rt.memory["q"] is True
+
+
+def test_timer_skipped_while_disabled_starts_fresh(io):
+    io.set("binary_sensor.b", "on")
+    rt = E.Runtime(io)
+    p = prog((S(el("NO", tag="binary_sensor.b"), el("TON", name="T", pt=10)), [el("COIL", tag="#q")]))
+    rt.load(p)
+    rt.scan(); io.t += 5; rt.scan()
+    p[0]["rungs"][0]["enabled"] = False
+    for _ in range(3):
+        io.t += 100; rt.scan()
+    p[0]["rungs"][0]["enabled"] = True
+    rt.scan()
+    assert rt.memory["q"] is False and rt.read("#T.ET") == 0  # no jump by the skipped time
+    io.t += 10; rt.scan()
+    assert rt.memory["q"] is True
+
+
+def test_restart_resyncs_and_no_false_edges(io):
+    io.set("binary_sensor.b", "off")
+    io.set("light.l", "off")
+    rt = E.Runtime(io)
+    rt.load(prog(
+        (S(el("P", tag="binary_sensor.b")), [el("PCOIL", tag="#edge")]),
+        (S(el("NO", tag="binary_sensor.b")), [el("COIL", tag="light.l")]),
+    ))
+    rt.scan()
+    # PLC stopped; meanwhile the input changes and someone turns the light on by hand
+    io.set("binary_sensor.b", "on")
+    io.set("light.l", "on")
+    rt.reset_transients()
+    rt.scan()
+    assert rt.memory["edge"] is False  # no edge from the stopped period
+    assert io.calls == []  # logic says on, light is on: nothing to do
+    io.set("binary_sensor.b", "off"); rt.scan()
+    assert io.calls[-1][1] == "turn_off"
+
+
+def test_output_resyncs_when_device_returns(io):
+    io.set("switch.s", "off")
+    io.set("binary_sensor.b", "on")
+    rt = E.Runtime(io)
+    rt.load(prog((S(el("NO", tag="binary_sensor.b")), [el("COIL", tag="switch.s")])))
+    rt.scan()
+    assert io.calls[-1][1] == "turn_on"
+    io.set("switch.s", "unavailable"); io.t += 10; rt.scan()
+    io.set("switch.s", "off"); io.t += 10; rt.scan()  # came back powered off
+    assert io.calls[-1][1] == "turn_on" and len(io.calls) == 2
+
+
+def test_test_mode(io):
+    io.set("binary_sensor.b", "off")
+    io.set("switch.s", "off")
+    rt = E.Runtime(io)
+    rt.load(prog(
+        (S(P(S(el("NO", tag="binary_sensor.b")), S(el("NO", tag="switch.s")))), [el("COIL", tag="switch.s")]),
+        (S(el("NO", tag="switch.s")), [el("NOTIFY", service="notify.x", message="on")]),
+    ))
+    rt.set_simulate(True)
+    rt.scan()
+    io.set("binary_sensor.b", "on"); rt.scan()
+    io.set("binary_sensor.b", "off"); rt.scan(); rt.scan()
+    assert io.calls == []  # nothing reached HA
+    assert rt.sim["switch.s"] is True  # seal-in holds on the simulated output
+    kinds = [x["kind"] for x in rt.simlog]
+    assert sorted(kinds) == ["action", "output"]
+    rt.set_simulate(False)
+    rt.scan()
+    assert io.calls == []  # real pump was never on, so the seal-in drops out and nothing is switched
+
+
+def test_light_brightness_readback_settles(io):
+    io.set("light.l", "on", brightness=128)
+    rt = E.Runtime(io)
+    rt.load(prog((S(), [el("MOVE", src=50, dst="light.l")])))
+    rt.scan()
+    assert rt.pending == {}  # 128/2.55 ≈ 50 %: already there, nothing pending
+
+
+def test_rung_error_clears(io):
+    rt = E.Runtime(io)
+    p = prog((S(el("NO", tag="#a")), [el("COIL", tag="#b")]))
+    rt.load(p)
+    rt.errors[p[0]["rungs"][0]["id"]] = "old"
+    rt.scan()
+    assert rt.errors == {}
+
+
+def test_duplicate_ids_rejected():
+    a = el("NO", tag="#x", id="dup")
+    with pytest.raises(ValueError, match="duplicate"):
+        E.validate_programs(prog((S(a), [el("COIL", tag="#y", id="dup")])))

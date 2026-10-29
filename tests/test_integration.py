@@ -110,6 +110,22 @@ async def test_setup_ws_and_scan(hass: HomeAssistant, hass_ws_client, freezer, m
     assert data[0][1] == "off" and data[-1][1] is True  # forced value recorded
     assert len(on) == 2  # forced input switched the light on again
 
+    # test mode: nothing reaches HA
+    assert hass.states.get("switch.ladder_logic_plc_test_mode").state == "off"
+    await hass.services.async_call("switch", "turn_on", {"entity_id": "switch.ladder_logic_plc_test_mode"}, blocking=True)
+    assert entry.runtime_data.simulate
+    n_on, n_off = len(on), len(off)
+    await hass.services.async_call("ha_ladder", "set_marker", {"name": "x", "value": 1}, blocking=True)
+    hass.states.async_set("input_boolean.motion", "off")
+    await ws.send_json({"id": 13, "type": "ha_ladder/unforce"})
+    for i in range(34, 60):
+        freezer.move_to(now + timedelta(milliseconds=260 * i))
+        async_fire_time_changed(hass, now + timedelta(milliseconds=260 * i))
+        await hass.async_block_till_done()
+    assert (len(on), len(off)) == (n_on, n_off)
+    assert entry.runtime_data.runtime.sim.get("light.hall") is False
+    await hass.services.async_call("switch", "turn_off", {"entity_id": "switch.ladder_logic_plc_test_mode"}, blocking=True)
+
     # RUN/STOP switch
     await hass.services.async_call("switch", "turn_off", {"entity_id": "switch.ladder_logic_plc_run"}, blocking=True)
     assert hass.states.get("switch.ladder_logic_plc_run").state == "off"
