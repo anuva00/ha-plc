@@ -4,7 +4,7 @@ const CW = 124;        // cell width
 const CH = 92;         // cell height
 const WY = 50;         // wire y inside a cell
 const RAIL = 14;       // rail inset
-const VERSION = "0.2.0";
+const VERSION = "0.2.1";
 
 const PALETTE = [
   { group: "Bit logic", items: [
@@ -1940,12 +1940,17 @@ class LadderPanel extends HTMLElement {
     cv.addEventListener("pointerleave", () => { if (!pts.size) { this._cursorT = null; this._traceLegendUpdate(); this._traceDraw(); } });
     cv.addEventListener("dblclick", () => { this.tview.live = true; this.tview.end = this._nowS(); this._renderTraceHead(); this._traceDraw(); });
     if (this._ro) this._ro.disconnect();
-    this._ro = new ResizeObserver(() => this._traceDraw());
+    // redraw only when the box itself changes size; the canvas never sizes the box (no feedback loop)
+    this._ro = new ResizeObserver((ents) => {
+      const r = ents[0].contentRect, k = Math.round(r.width) + "x" + Math.round(r.height);
+      if (k !== this._roKey) { this._roKey = k; this._traceDraw(); }
+    });
     this._ro.observe(this.shadowRoot.getElementById("chartbox"));
   }
   _traceDraw() {
     const cv = this.shadowRoot.getElementById("chart"); if (!cv || this.view !== "trace") return;
-    const box = cv.parentElement.getBoundingClientRect();
+    const host = cv.parentElement;
+    const box = { width: host.clientWidth, height: host.clientHeight };
     const sigs = this.trace.signals.filter((s) => !this.trace.hidden[s]);
     const C = this._colors();
     const css = getComputedStyle(this);
@@ -2228,7 +2233,7 @@ table.tags .empty { text-align: center; padding: 30px; }
 .uchip:hover { border-color: var(--accent); }
 .fbadge { fill: #f59e0b; }
 .fbadget { fill: #1b1300; font: 800 9px system-ui; }
-.tracewrap { display: grid; grid-template-columns: 250px 1fr; gap: 12px; height: calc(100% - 50px); min-height: 360px; }
+.tracewrap { display: grid; grid-template-columns: 250px 1fr; gap: 12px; height: max(360px, calc(100vh - 150px)); }
 .legend { background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow-y: auto; }
 .lrow { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-bottom: 1px solid var(--line); }
 .lrow.off { opacity: .45; }
@@ -2238,7 +2243,7 @@ table.tags .empty { text-align: center; padding: 30px; }
 .lval { font-size: 12px; font-weight: 600; color: var(--accent); max-width: 70px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lval.atcursor { color: var(--fg); }
 .mini.x { padding: 1px 6px; }
-.chartbox { position: relative; background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: auto; min-height: 300px; }
+.chartbox { position: relative; background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow-x: hidden; overflow-y: auto; min-height: 0; height: 100%; }
 .val.fval { fill: #f59e0b; }
 :host([narrow]) .hidenarrow, :host([narrow]) #theme { display: none; }
 :host([narrow]:not([view="ladder"])) #undo, :host([narrow]:not([view="ladder"])) #online { display: none; }
@@ -2254,11 +2259,11 @@ table.tags .empty { text-align: center; padding: 30px; }
 :host([narrow]) table.tags td:nth-child(9) { grid-column: 3; grid-row: 3; text-align: right; }
 :host([narrow]) table.tags td:nth-child(6):has(> .muted:only-child) { display: none; }
 :host([narrow]) .addwatch { min-width: 0; width: 100%; }
-.chartbox canvas { display: block; touch-action: none; cursor: crosshair; }
+.chartbox canvas { position: absolute; left: 0; top: 0; display: block; touch-action: none; cursor: crosshair; }
 .charthint { position: absolute; right: 10px; top: 6px; font-size: 10.5px; color: var(--muted); pointer-events: none; }
-:host([narrow]) .tracewrap { grid-template-columns: 1fr; grid-template-rows: auto 1fr; height: auto; }
+:host([narrow]) .tracewrap { grid-template-columns: 1fr; grid-template-rows: auto 60vh; height: auto; }
 :host([narrow]) .legend { max-height: 180px; }
-:host([narrow]) .chartbox { min-height: 420px; }
+:host([narrow]) .chartbox { min-height: 320px; }
 :host([narrow]) .views button { padding: 6px 8px; }
 :host([narrow]) .forcepill { display: none; }
 .tabs { display: flex; gap: 4px; flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: none; }
