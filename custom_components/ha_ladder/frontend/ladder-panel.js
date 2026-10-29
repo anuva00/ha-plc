@@ -4,7 +4,7 @@ const CW = 124;        // cell width
 const CH = 92;         // cell height
 const WY = 50;         // wire y inside a cell
 const RAIL = 14;       // rail inset
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 
 const PALETTE = [
   { group: "Bit logic", items: [
@@ -142,6 +142,11 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const trunc = (s, n) => { s = String(s ?? ""); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
+function fmtDiffVal(v) {
+  if (v === undefined || v === null || v === "") return "∅";
+  if (Array.isArray(v)) return "[" + v.join(",") + "]";
+  return typeof v === "string" ? `“${v.length > 30 ? v.slice(0, 29) + "…" : v}”` : String(v);
+}
 function fmtVal(v) {
   if (v === null || v === undefined) return "—";
   if (typeof v === "boolean") return v ? "1" : "0";
@@ -432,9 +437,10 @@ class LadderPanel extends HTMLElement {
     this._mutate(() => { this.prog.rungs.splice(this.prog.rungs.indexOf(r) + 1, 0, c); this.sel = { rung: c.id, ids: [] }; });
   }
 
-  async _save() {
+  async _save(note = "") {
     try {
-      await this._hass.callWS({ type: "ha_ladder/save", programs: this.programs });
+      await this._hass.callWS({ type: "ha_ladder/save", programs: this.programs, note });
+      this._histCache = null;
       this._setDirty(false);
       const probs = this._analyze().problems.filter((x) => x.level !== "info");
       this._toast(probs.length ? `Saved — ${probs.length} check${probs.length > 1 ? "s" : ""} to look at (⚠ in the toolbar)` : "Saved — the runtime is now using this version");
@@ -470,7 +476,7 @@ class LadderPanel extends HTMLElement {
           <button class="icon menu" id="menu" title="Menu">☰</button>
           <div class="title">Ladder Logic</div>
           <div class="views" id="views">
-            <button data-view="ladder" class="on">Ladder</button><button data-view="tags">Tags</button><button data-view="trace">Trace</button>
+            <button data-view="ladder" class="on">Ladder</button><button data-view="tags">Tags</button><button data-view="trace">Trace</button><button data-view="history">History</button>
           </div>
           <button class="forcepill" id="forcepill" hidden title="Forced tags are active — click to see them">F</button>
           <div class="tabs" id="tabs"></div>
@@ -508,7 +514,11 @@ class LadderPanel extends HTMLElement {
     $("checks").onclick = () => { this.sel = null; this._showChecks = true; if (this.view !== "ladder") this._setView("ladder"); this._renderProps(); this._updateSvgs(); };
     $("undo").onclick = () => this._undo();
     $("redo").onclick = () => this._undo(true);
-    $("save").onclick = () => this._save();
+    $("save").onclick = (e) => {
+      if (e.shiftKey) { const n = prompt("Note for this version (shown in History):", ""); if (n === null) return; this._save(n); }
+      else this._save();
+    };
+    $("save").title = "Save & download to runtime (Ctrl+S). Shift-click to add a note for the version history.";
     $("theme").onclick = () => {
       this.theme = { auto: "dark", dark: "light", light: "auto" }[this.theme] || "auto";
       try { localStorage.setItem("ha_ladder_theme", this.theme); } catch (e) { /* private mode */ }
@@ -1746,6 +1756,7 @@ class LadderPanel extends HTMLElement {
     $("page").hidden = v === "ladder";
     if (v === "tags") this._renderTags();
     else if (v === "trace") this._renderTrace();
+    else if (v === "history") this._renderHistory();
     else this._render();
     this._renderToolbar();
   }
@@ -1756,10 +1767,13 @@ class LadderPanel extends HTMLElement {
   _pageClick(e) {
     if (this.view === "tags") return this._tagsClick(e);
     if (this.view === "trace") return this._traceClick(e);
+    if (this.view === "history") return this._histClick(e);
   }
   _pageInput(e) {
     const t = e.target;
     if (t.dataset.pick && e.type === "input" && !(e.detail && e.detail.fromPicker)) { this._pickFilter(t); return; }
+    if (this.view === "history" && t.id === "hnote" && e.type === "change") { this._histNote(t.value); return; }
+    if (this.view === "history" && t.id === "hfile" && e.type === "change") { this._histFile(t.files[0]); t.value = ""; return; }
     if (this.view === "tags" && t.id === "tagq") { this.tagQuery = t.value; this._tagsBody(); return; }
     if (this.view === "tags" && t.dataset.pick && e.detail && e.detail.fromPicker) {
       const v = t.value.trim(); t.value = "";
@@ -1959,6 +1973,236 @@ class LadderPanel extends HTMLElement {
       }
     }
     this._tagSig = null;
+  }
+
+  /* ---------- history & backups ---------- */
+  async _renderHistory() {
+    const page = this.shadowRoot.getElementById("page");
+    page.innerHTML = `<div class="pagehead"><h2>History</h2><span class="muted small">Every Save is kept as a version — the newest 50, plus any you pin ★ (kept forever).</span></div>
+      <div class="histwrap"><div class="hlist" id="hlist"><div class="muted pad">Loading…</div></div><div class="hdetail" id="hdetail"></div></div>
+      <div class="pagehead backups"><h3>File backups</h3><span class="muted small" id="bfolder"></span><div class="spacer"></div>
+        <button class="mini" data-hact="backupnow">Back up now</button>
+        <button class="mini" data-hact="downloadall">Download full backup</button>
+        <label class="mini filebtn">Restore from file…<input type="file" id="hfile" accept=".json,application/json" hidden></label></div>
+      <div class="tablewrap"><table class="tags"><thead><tr><th>File</th><th>Created</th><th class="r">Size</th><th></th></tr></thead><tbody id="blist"><tr><td colspan="4" class="muted empty">Loading…</td></tr></tbody></table></div>
+      <p class="muted small">Backups are JSON files in your config folder (included in Home Assistant backups). Automate them with the <span class="mono">ha_ladder.backup</span> action, e.g. nightly with <span class="mono">keep: 30</span>.</p>`;
+    await this._histLoad();
+    this._backupsLoad();
+  }
+  async _histLoad() {
+    try {
+      const r = await this._hass.callWS({ type: "ha_ladder/history/list" });
+      this._hist = r.versions;
+    } catch (e) { this._toast("History: " + (e.message || e), true); this._hist = []; }
+    if (!this._histSel || (this._histSel !== "file" && !this._hist.some((v) => v.id === this._histSel))) this._histSel = this._hist[1] ? this._hist[1].id : this._hist[0] && this._hist[0].id;
+    this._histList();
+    this._histDetail();
+  }
+  _fmtWhen(ts) {
+    const d = new Date(ts * 1000), now = new Date();
+    const sameDay = d.toDateString() === now.toDateString();
+    const y = new Date(now); y.setDate(now.getDate() - 1);
+    const t = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+    const day = sameDay ? "Today" : d.toDateString() === y.toDateString() ? "Yesterday" : d.toLocaleDateString([], { day: "numeric", month: "short", year: d.getFullYear() === now.getFullYear() ? undefined : "numeric" });
+    const ago = (Date.now() / 1000 - ts);
+    const rel = ago < 60 ? "just now" : ago < 3600 ? `${Math.floor(ago / 60)} min ago` : ago < 86400 ? `${Math.floor(ago / 3600)} h ago` : `${Math.floor(ago / 86400)} d ago`;
+    return { label: `${day} ${t}`, rel };
+  }
+  _histList() {
+    const el = this.shadowRoot.getElementById("hlist"); if (!el) return;
+    const vs = this._hist || [];
+    const src = { initial: "first", save: "", restore: "restore", import: "import" };
+    el.innerHTML = vs.map((v, i) => {
+      const w = this._fmtWhen(v.ts);
+      return `<div class="hrow ${this._histSel === v.id ? "on" : ""}" data-hv="${v.id}">
+        <button class="star ${v.pinned ? "on" : ""}" data-hpin="${v.id}" title="${v.pinned ? "Pinned — kept forever" : "Pin to keep forever"}">${v.pinned ? "★" : "☆"}</button>
+        <div class="hmain"><div><b>${esc(w.label)}</b> <span class="muted small">${esc(w.rel)}</span>${i === 0 ? ` <span class="badge run">running</span>` : ""}${src[v.source] ? ` <span class="badge">${src[v.source]}</span>` : ""}</div>
+        <div class="muted small">${v.note ? `<span class="hnote">${esc(v.note)}</span> · ` : ""}${v.summary.programs} program${v.summary.programs === 1 ? "" : "s"} · ${v.summary.rungs} rungs</div></div></div>`;
+    }).join("") || `<div class="muted pad">No versions yet.</div>`;
+  }
+  async _histGet(id) {
+    this._histCache = this._histCache || {};
+    if (this._histCache[id]) return this._histCache[id];
+    const v = await this._hass.callWS({ type: "ha_ladder/history/get", version: id });
+    this._histCache[id] = v;
+    return v;
+  }
+  async _histDetail() {
+    const el = this.shadowRoot.getElementById("hdetail"); if (!el) return;
+    const vs = this._hist || [];
+    if (!this._histSel || !vs.length) { el.innerHTML = ""; return; }
+    let v, isFile = this._histSel === "file";
+    try {
+      v = isFile ? this._histFileData : await this._histGet(this._histSel);
+      var running = await this._histGet(vs[0].id);
+    } catch (e) { el.innerHTML = `<div class="errbox">${esc(e.message || e)}</div>`; return; }
+    if (!v) { el.innerHTML = ""; return; }
+    const isRunning = !isFile && v.id === vs[0].id;
+    const w = isFile ? null : this._fmtWhen(v.ts);
+    const diff = this._diff(running.programs, v.programs);
+    const nchg = diff.reduce((a, p) => a + (p.status !== "same" ? 1 : 0) + p.changes.length, 0);
+    el.innerHTML = `
+      <div class="hhead">
+        <div><h3>${isFile ? `📄 ${esc(v.fileName || "Backup file")}` : esc(w.label)}${isRunning ? ` <span class="badge run">running</span>` : ""}</h3>
+          <div class="muted small">${isFile ? `Backup created ${esc(v.created || "?")}${v.version ? " · Ladder Logic " + esc(v.version) : ""}` : esc(w.rel)} · ${v.programs.length} program${v.programs.length === 1 ? "" : "s"} · ${v.programs.reduce((a, p) => a + p.rungs.length, 0)} rungs</div></div>
+        ${isFile ? "" : `<input id="hnote" class="search" placeholder="Add a note…" value="${esc(v.note || "")}" maxlength="200">`}
+      </div>
+      <div class="acts">
+        ${isRunning ? "" : `<button class="mini primary" data-hact="restore">⟲ Restore this version</button>`}
+        <button class="mini" data-hact="load" title="Open it in the editor without saving, to look around or pick bits">Open in editor</button>
+        <button class="mini" data-hact="download">Download JSON</button>
+        ${isFile ? "" : `<button class="mini" data-hact="pin">${v.pinned ? "★ Unpin" : "☆ Pin"}</button>`}
+        ${isFile || isRunning ? "" : `<button class="mini danger" data-hact="delete">Delete</button>`}
+      </div>
+      <div class="wtitle">${isRunning ? "This is the running version" : `Restoring would change ${nchg ? nchg + " thing" + (nchg === 1 ? "" : "s") : "nothing"} compared with the running version`}</div>
+      ${isRunning ? (this.dirty ? `<p class="muted">The editor has unsaved changes that aren't in any version yet.</p>` : `<p class="muted">Pick an older version on the left to see what changed.</p>`) : this._diffHtml(diff)}`;
+  }
+  _diff(cur, old) {
+    // what restoring `old` would do to `cur`, per program and rung
+    const out = [];
+    const cm = new Map(cur.map((p) => [p.id, p])), om = new Map(old.map((p) => [p.id, p]));
+    const els = (r) => { const m = new Map(); walk(r.logic, (n) => n.t === "el" && m.set(n.id, n)); (r.outputs || []).forEach((o) => m.set(o.id, o)); return m; };
+    const shape = (n) => !n ? "" : n.t === "el" ? n.id : n.t === "series" ? "S(" + n.items.map(shape).join(",") + ")" : "P(" + n.branches.map(shape).join("|") + ")";
+    const strip = (o) => { const c = { ...o }; delete c.id; delete c.t; return JSON.stringify(c); };
+    for (const p of old) {
+      const c = cm.get(p.id);
+      if (!c) { out.push({ name: p.name, status: "added", changes: p.rungs.map((r, i) => ({ kind: "added", idx: i, rung: r })) }); continue; }
+      const entry = { name: p.name, status: "same", changes: [], meta: [] };
+      if (c.name !== p.name) entry.meta.push(`renamed from “${c.name}”`);
+      if (!!c.enabled !== !!p.enabled) entry.meta.push(p.enabled ? "would be enabled" : "would be disabled");
+      const crm = new Map(c.rungs.map((r, i) => [r.id, { r, i }]));
+      const orm = new Map(p.rungs.map((r, i) => [r.id, { r, i }]));
+      p.rungs.forEach((r, i) => {
+        const cr = crm.get(r.id);
+        if (!cr) { entry.changes.push({ kind: "added", idx: i, rung: r }); return; }
+        const details = [];
+        if ((cr.r.comment || "") !== (r.comment || "")) details.push(`comment: “${cr.r.comment || ""}” → “${r.comment || ""}”`);
+        if (!!cr.r.enabled !== !!r.enabled) details.push(r.enabled ? "rung enabled" : "rung disabled");
+        const ce = els(cr.r), oe = els(r);
+        for (const [id, e] of oe) {
+          const x = ce.get(id);
+          if (!x) details.push(`+ ${this._elLabel(e)}`);
+          else if (strip(x) !== strip(e)) {
+            const keys = new Set([...Object.keys(x), ...Object.keys(e)]);
+            const ch = [...keys].filter((k) => k !== "id" && k !== "t" && JSON.stringify(x[k]) !== JSON.stringify(e[k])).map((k) => `${k}: ${fmtDiffVal(x[k])} → ${fmtDiffVal(e[k])}`);
+            details.push(`${this._elLabel(e)}: ${ch.join(", ")}`);
+          }
+        }
+        for (const [id, e] of ce) if (!oe.has(id)) details.push(`− ${this._elLabel(e)}`);
+        if (!details.some((d) => /^[+−]/.test(d)) && shape(cr.r.logic) !== shape(r.logic)) details.push("wiring changed");
+        if (details.length) entry.changes.push({ kind: "changed", idx: i, rung: r, details });
+        else if (cr.i !== i) entry.changes.push({ kind: "moved", idx: i, rung: r, from: cr.i });
+      });
+      c.rungs.forEach((r, i) => { if (!orm.has(r.id)) entry.changes.push({ kind: "removed", idx: i, rung: r }); });
+      if (entry.changes.length || entry.meta.length) entry.status = "changed";
+      out.push(entry);
+    }
+    for (const c of cur) if (!om.has(c.id)) out.push({ name: c.name, status: "removed", changes: [] });
+    return out;
+  }
+  _elLabel(e) {
+    const t = e.tag || e.dst || e.name || e.service || e.a || "";
+    return `${e.type}${t ? " " + trunc(t, 40) : ""}`;
+  }
+  _diffHtml(diff) {
+    const changed = diff.filter((p) => p.status !== "same");
+    if (!changed.length) return `<p class="muted">✓ Identical to the running version.</p>`;
+    const kindTxt = { added: "would be added", removed: "would be removed", changed: "would change", moved: "would move" };
+    return changed.map((p) => `<div class="dprog ${p.status}"><div class="dpname">${p.status === "added" ? "＋ " : p.status === "removed" ? "− " : ""}<b>${esc(p.name)}</b>
+        <span class="muted small">${p.status === "added" ? "program would be added" : p.status === "removed" ? "program would be removed" : (p.meta || []).join(" · ")}</span></div>
+      ${p.changes.map((c) => `<div class="drung ${c.kind}"><span class="dk ${c.kind}">${c.kind}</span><div><b>Rung ${c.idx + 1}${c.kind === "removed" ? " (current)" : ""}</b>${c.rung.comment ? ` — ${esc(c.rung.comment)}` : ""}${c.kind === "moved" ? ` <span class="muted">(now rung ${c.from + 1})</span>` : ""}
+        <div class="muted small">${this._rungSummary(c.rung)}</div>
+        ${c.details ? `<ul class="dlist">${c.details.map((d) => `<li class="${d.startsWith("+") ? "plus" : d.startsWith("−") ? "minus" : ""}">${esc(d)}</li>`).join("")}</ul>` : ""}</div></div>`).join("")}</div>`).join("");
+  }
+  async _histClick(e) {
+    const t = e.target;
+    const pin = t.closest("[data-hpin]");
+    if (pin) { const v = this._hist.find((x) => x.id === pin.dataset.hpin); await this._hass.callWS({ type: "ha_ladder/history/update", version: v.id, pinned: !v.pinned }); this._histCache = null; await this._histLoad(); return; }
+    const row = t.closest("[data-hv]");
+    if (row) { this._histSel = row.dataset.hv; this._histList(); this._histDetail(); return; }
+    const bf = t.closest("[data-bfile]");
+    const act = t.closest("[data-hact]"); if (!act && !bf) return;
+    const a = bf ? bf.dataset.bact : act.dataset.hact;
+    const isFile = this._histSel === "file";
+    const getSel = async () => (isFile ? this._histFileData : await this._histGet(this._histSel));
+    try {
+      if (a === "restore") {
+        const v = await getSel();
+        const when = isFile ? `backup ${v.fileName || ""}` : this._fmtWhen(v.ts).label;
+        if (!confirm(`Restore the version from ${when}?\n\nIt replaces the running programs right away (the current version stays in History, so you can go back).${this.dirty ? "\n\nYour unsaved editor changes will be discarded." : ""}`)) return;
+        await this._hass.callWS({ type: "ha_ladder/save", programs: v.programs, note: `Restored from ${when}`, source: "restore" });
+        this.programs = clone(v.programs); this.pi = 0; this.sel = null; this.undo = []; this.redo = []; this._setDirty(false); this._anGen = (this._anGen || 0) + 1;
+        this._histCache = null; this._histSel = null; this._histFileData = null;
+        this._toast("Restored — the runtime is using it now");
+        await this._histLoad();
+      } else if (a === "load") {
+        const v = await getSel();
+        if (this.dirty && !confirm("Replace the editor contents? Your unsaved changes can be undone with Ctrl+Z.")) return;
+        this.undo.push(JSON.stringify({ programs: this.programs, pi: this.pi }));
+        this.programs = clone(v.programs); this.pi = 0; this.sel = null; this._setDirty(true); this._anGen = (this._anGen || 0) + 1;
+        this._setView("ladder");
+        this._toast("Opened in the editor (not running) — Save to run it, Ctrl+Z to go back");
+      } else if (a === "download") {
+        const v = await getSel();
+        this._downloadJson({ type: "ha_ladder_backup", version: VERSION, created: new Date((v.ts || Date.now() / 1000) * 1000).toISOString(), note: v.note || "", programs: v.programs }, `ladder-version-${new Date((v.ts || Date.now() / 1000) * 1000).toISOString().slice(0, 16).replace(/[:T]/g, "")}.json`);
+      } else if (a === "pin") {
+        const v = this._hist.find((x) => x.id === this._histSel);
+        await this._hass.callWS({ type: "ha_ladder/history/update", version: v.id, pinned: !v.pinned }); this._histCache = null; await this._histLoad();
+      } else if (a === "delete") {
+        if (!confirm("Delete this version from History?")) return;
+        await this._hass.callWS({ type: "ha_ladder/history/delete", version: this._histSel }); this._histCache = null; this._histSel = null; await this._histLoad();
+      } else if (a === "backupnow") {
+        const r = await this._hass.callWS({ type: "ha_ladder/backup/create" });
+        this._toast(`Backed up to ${r.name}`); this._backupsLoad();
+      } else if (a === "downloadall") {
+        const v = await this._histGet(this._hist[0].id);
+        this._downloadJson({ type: "ha_ladder_backup", version: VERSION, created: new Date().toISOString(), programs: v.programs, settings: this.settings }, `ladder-backup-${new Date().toISOString().slice(0, 10)}.json`);
+      } else if (a === "bdownload" || a === "brestore") {
+        const doc = await this._hass.callWS({ type: "ha_ladder/backup/get", name: bf.dataset.bfile });
+        if (a === "bdownload") this._downloadJson(doc, bf.dataset.bfile);
+        else this._histShowFile({ ...doc, fileName: bf.dataset.bfile });
+      }
+    } catch (err) { this._toast(String(err.message || err), true); }
+  }
+  async _histNote(note) {
+    if (!this._histSel || this._histSel === "file") return;
+    await this._hass.callWS({ type: "ha_ladder/history/update", version: this._histSel, note });
+    this._histCache = null;
+    const v = this._hist.find((x) => x.id === this._histSel); if (v) v.note = note;
+    this._histList();
+    this._toast("Note saved");
+  }
+  async _histFile(file) {
+    if (!file) return;
+    try {
+      const data = JSON.parse(await file.text());
+      const programs = Array.isArray(data) ? data : data.programs;
+      if (!Array.isArray(programs) || programs.some((p) => !p || !Array.isArray(p.rungs))) throw new Error("this file doesn't contain ladder programs");
+      this._histShowFile({ ...(Array.isArray(data) ? {} : data), programs, fileName: file.name });
+    } catch (e) { this._toast("Can't read backup: " + e.message, true); }
+  }
+  _histShowFile(doc) {
+    this._histFileData = doc;
+    this._histSel = "file";
+    this._histList();
+    this._histDetail();
+    this.shadowRoot.getElementById("hdetail").scrollIntoView({ block: "start", behavior: "smooth" });
+  }
+  async _backupsLoad() {
+    const body = this.shadowRoot.getElementById("blist"); if (!body) return;
+    try {
+      const r = await this._hass.callWS({ type: "ha_ladder/backup/list" });
+      const f = this.shadowRoot.getElementById("bfolder"); if (f) f.textContent = r.folder;
+      body.innerHTML = r.backups.length ? r.backups.map((b) => `<tr><td class="mono">${esc(b.name)}</td><td>${esc(this._fmtWhen(b.mtime).label)}</td><td class="r">${(b.size / 1024).toFixed(1)} KB</td>
+        <td class="nowrap"><button class="mini" data-bfile="${esc(b.name)}" data-bact="brestore">Preview / restore</button><button class="mini" data-bfile="${esc(b.name)}" data-bact="bdownload">Download</button></td></tr>`).join("")
+        : `<tr><td colspan="4" class="muted empty">No backup files yet — “Back up now” writes one.</td></tr>`;
+    } catch (e) { body.innerHTML = `<tr><td colspan="4" class="errbox">${esc(e.message || e)}</td></tr>`; }
+  }
+  _downloadJson(obj, name) {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" }));
+    a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   }
 
   /* ---------- trace ---------- */
@@ -2311,6 +2555,7 @@ class LadderPanel extends HTMLElement {
       this._renderToolbar();
       if (this.view === "tags") { this._tagsUpdate(); return; }
       if (this.view === "trace") { this._traceLegendUpdate(); this._traceDraw(); return; }
+      if (this.view === "history") return;
       const modeKey = `${!!(this.mon && this.mon.running)}/${!!(this.mon && this.mon.simulate)}`;
       if (this._wasRunning !== modeKey) {
         this._wasRunning = modeKey;
@@ -2390,8 +2635,8 @@ header { display: flex; align-items: center; gap: 8px; padding: 0 12px; height: 
 .forcepill { border: 0; background: #f59e0b; color: #1b1300; font-weight: 700; border-radius: 12px; padding: 4px 10px; font-size: 12px; white-space: nowrap; animation: fpulse 2s infinite; }
 @keyframes fpulse { 50% { opacity: .65; } }
 :host(:not([view])) #page, :host([view="ladder"]) #page { display: none; }
-:host([view="tags"]) .body, :host([view="trace"]) .body { grid-template-columns: 1fr !important; grid-template-rows: 1fr !important; }
-:host([view="tags"]) .palette, :host([view="tags"]) .props, :host([view="trace"]) .palette, :host([view="trace"]) .props { display: none !important; }
+:host([view="tags"]) .body, :host([view="trace"]) .body, :host([view="history"]) .body { grid-template-columns: 1fr !important; grid-template-rows: 1fr !important; }
+:host([view="tags"]) .palette, :host([view="tags"]) .props, :host([view="trace"]) .palette, :host([view="trace"]) .props, :host([view="history"]) .palette, :host([view="history"]) .props { display: none !important; }
 #page { overflow: auto; padding: 14px 18px 40px; min-width: 0; }
 .pagehead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
 .pagehead h2 { margin: 0 8px 0 0; font-size: 20px; font-weight: 500; }
@@ -2484,6 +2729,34 @@ table.tags .empty { text-align: center; padding: 30px; }
 .prob.error { border-color: var(--err); }
 .prob.warn { border-color: #f59e0b; }
 .prob .uchip { margin-top: 4px; }
+.histwrap { display: grid; grid-template-columns: 340px 1fr; gap: 12px; align-items: start; margin-bottom: 22px; }
+.hlist { background: var(--card); border: 1px solid var(--line); border-radius: 12px; max-height: 62vh; overflow-y: auto; }
+.hrow { display: flex; gap: 8px; align-items: flex-start; padding: 8px 10px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.hrow:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.hrow.on { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.hmain { min-width: 0; flex: 1; font-size: 13px; }
+.hnote { color: var(--fg); }
+.star { border: 0; background: transparent; font-size: 16px; color: var(--muted); padding: 0 2px; line-height: 1.2; }
+.star.on { color: #f59e0b; }
+.badge { font: 700 9.5px system-ui; text-transform: uppercase; border-radius: 4px; padding: 1px 5px; background: var(--bg); border: 1px solid var(--line); color: var(--muted); vertical-align: 1px; }
+.badge.run { background: var(--on); border-color: var(--on); color: #fff; }
+.hdetail { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; min-height: 200px; }
+.hhead { display: flex; gap: 10px; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; }
+.hhead h3 { margin: 0 0 2px; font-size: 16px; }
+.hhead .search { min-width: 240px; }
+.mini.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.dprog { border: 1px solid var(--line); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
+.dpname { padding: 7px 10px; background: var(--bg); border-bottom: 1px solid var(--line); }
+.drung { display: flex; gap: 10px; padding: 8px 10px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.drung:last-child { border-bottom: 0; }
+.dk { font: 700 9.5px system-ui; text-transform: uppercase; border-radius: 4px; padding: 2px 6px; height: fit-content; min-width: 60px; text-align: center; color: #fff; }
+.dk.added { background: var(--on); } .dk.removed { background: var(--err); } .dk.changed { background: #f59e0b; color: #1b1300; } .dk.moved { background: var(--off); }
+.dlist { margin: 4px 0 0; padding-left: 16px; font: 12px ui-monospace, Menlo, monospace; }
+.dlist li.plus { color: var(--on); } .dlist li.minus { color: var(--err); }
+.backups h3 { margin: 0 8px 0 0; font-size: 16px; font-weight: 500; }
+.filebtn { cursor: pointer; display: inline-block; }
+:host([narrow]) .histwrap { grid-template-columns: 1fr; }
+:host([narrow]) .hlist { max-height: 40vh; }
 .chartbox canvas { position: absolute; left: 0; top: 0; display: block; touch-action: none; cursor: crosshair; }
 .charthint { position: absolute; right: 10px; top: 6px; font-size: 10.5px; color: var(--muted); pointer-events: none; }
 :host([narrow]) .tracewrap { grid-template-columns: 1fr; grid-template-rows: auto 60vh; height: auto; }

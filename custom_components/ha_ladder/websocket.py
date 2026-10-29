@@ -17,7 +17,8 @@ def _ctrl(hass: HomeAssistant):
 
 @callback
 def async_register_websocket(hass: HomeAssistant) -> None:
-    for cmd in (ws_get, ws_save, ws_run, ws_settings, ws_monitor, ws_set_memory, ws_force, ws_unforce, ws_trace_set, ws_trace_get, ws_simulate):
+    for cmd in (ws_get, ws_save, ws_run, ws_settings, ws_monitor, ws_set_memory, ws_force, ws_unforce, ws_trace_set, ws_trace_get, ws_simulate,
+                ws_hist_list, ws_hist_get, ws_hist_update, ws_hist_delete, ws_backup_create, ws_backup_list, ws_backup_get):
         websocket_api.async_register_command(hass, cmd)
 
 
@@ -38,7 +39,7 @@ def ws_get(hass, connection, msg) -> None:
 
 
 @websocket_api.websocket_command(
-    {vol.Required("type"): f"{DOMAIN}/save", vol.Required("programs"): [dict]}
+    {vol.Required("type"): f"{DOMAIN}/save", vol.Required("programs"): [dict], vol.Optional("note"): str, vol.Optional("source"): vol.In(["save", "restore", "import"])}
 )
 @websocket_api.require_admin
 @websocket_api.async_response
@@ -47,11 +48,11 @@ async def ws_save(hass, connection, msg) -> None:
     if c is None:
         return _not_ready(connection, msg)
     try:
-        await c.async_save_programs(msg["programs"])
+        v = await c.async_save_programs(msg["programs"], msg.get("note", ""), msg.get("source", "save"))
     except ValueError as err:
         connection.send_error(msg["id"], "invalid", str(err))
         return
-    connection.send_result(msg["id"], {"ok": True})
+    connection.send_result(msg["id"], {"ok": True, "version": v["id"] if v else None})
 
 
 @websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/run", vol.Required("running"): bool})
@@ -170,3 +171,82 @@ async def ws_simulate(hass, connection, msg) -> None:
         return _not_ready(connection, msg)
     await c.async_set_simulate(msg["enabled"])
     connection.send_result(msg["id"], {"simulate": c.simulate})
+
+
+def _ws_async(schema: dict):
+    """Admin-only async websocket command."""
+    def deco(fn):
+        return websocket_api.websocket_command(schema)(websocket_api.require_admin(websocket_api.async_response(fn)))
+    return deco
+
+
+@_ws_async({vol.Required("type"): f"{DOMAIN}/history/list"})
+async def ws_hist_list(hass, connection, msg) -> None:
+    c = _ctrl(hass)
+    if c is None:
+        return _not_ready(connection, msg)
+    connection.send_result(msg["id"], {"versions": c.history.listing()})
+
+
+@_ws_async({vol.Required("type"): f"{DOMAIN}/history/get", vol.Required("version"): str})
+async def ws_hist_get(hass, connection, msg) -> None:
+    c = _ctrl(hass)
+    if c is None:
+        return _not_ready(connection, msg)
+    try:
+        connection.send_result(msg["id"], c.history.get(msg["version"]))
+    except KeyError:
+        connection.send_error(msg["id"], "not_found", "version not found")
+
+
+@_ws_async({vol.Required("type"): f"{DOMAIN}/history/update", vol.Required("version"): str, vol.Optional("note"): str, vol.Optional("pinned"): bool})
+async def ws_hist_update(hass, connection, msg) -> None:
+    c = _ctrl(hass)
+    if c is None:
+        return _not_ready(connection, msg)
+    try:
+        v = await c.history.async_update(msg["version"], msg.get("note"), msg.get("pinned"))
+    except KeyError:
+        connection.send_error(msg["id"], "not_found", "version not found")
+        return
+    connection.send_result(msg["id"], v)
+
+
+@_ws_async({vol.Required("type"): f"{DOMAIN}/history/delete", vol.Required("version"): str})
+async def ws_hist_delete(hass, connection, msg) -> None:
+    c = _ctrl(hass)
+    if c is None:
+        return _not_ready(connection, msg)
+    try:
+        await c.history.async_delete(msg["version"])
+    except (KeyError, ValueError) as err:
+        connection.send_error(msg["id"], "invalid", str(err))
+        return
+    connection.send_result(msg["id"], {"ok": True})
+
+
+@_ws_async({vol.Required("type"): f"{DOMAIN}/backup/create", vol.Optional("label"): str})
+async def ws_backup_create(hass, connection, msg) -> None:
+    c = _ctrl(hass)
+    if c is None:
+        return _not_ready(connection, msg)
+    connection.send_result(msg["id"], await c.async_backup(label=msg.get("label", "")))
+
+
+@_ws_async({vol.Required("type"): f"{DOMAIN}/backup/list"})
+async def ws_backup_list(hass, connection, msg) -> None:
+    c = _ctrl(hass)
+    if c is None:
+        return _not_ready(connection, msg)
+    connection.send_result(msg["id"], {"backups": await c.history.async_list_backups(), "folder": hass.config.path("ladder_backups")})
+
+
+@_ws_async({vol.Required("type"): f"{DOMAIN}/backup/get", vol.Required("name"): str})
+async def ws_backup_get(hass, connection, msg) -> None:
+    c = _ctrl(hass)
+    if c is None:
+        return _not_ready(connection, msg)
+    try:
+        connection.send_result(msg["id"], await c.history.async_read_backup(msg["name"]))
+    except ValueError as err:
+        connection.send_error(msg["id"], "invalid", str(err))

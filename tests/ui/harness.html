@@ -38,6 +38,19 @@ const sample = [{id:"main", name:"Hallway", enabled:true, rungs:[
 ]}];
 window.saved = null; window.calls = [];
 const forces = {}; let simulate = false; const mem = {hall_used:true, reset_count:false, setpoint: 22};
+const versions = []; const backups = [];
+{ // seed: an older version where rung 1 had a 60 s TOF and no CMP branch, rung 3 didn't exist, plus a deleted rung
+  const old = JSON.parse(JSON.stringify(sample));
+  old[0].rungs[0].logic.items[2].pt = "60"; old[0].rungs[0].comment = "Hall light on motion";
+  old[0].rungs[0].logic.items[0].branches.pop();
+  old[0].rungs.splice(2, 1);
+  old[0].rungs.push({id:"rold", comment:"Old porch rung", enabled:true, logic:{id:"so",t:"series",items:[{id:"oe1",t:"el",type:"NO",tag:"binary_sensor.front_door"}]}, outputs:[{id:"oo1",t:"el",type:"COIL",tag:"switch.porch"}]});
+  const now = Date.now()/1000;
+  versions.push({id:"vcur", ts: now - 600, note:"", source:"save", pinned:false, summary:{programs:1,rungs:3}, programs: JSON.parse(JSON.stringify(sample))});
+  versions.push({id:"vold", ts: now - 86400*2, note:"before CMP tweak", source:"save", pinned:true, summary:{programs:1,rungs:3}, programs: old});
+  versions.push({id:"vinit", ts: now - 86400*9, note:"", source:"initial", pinned:false, summary:{programs:1,rungs:1}, programs: [{id:"main",name:"Main",enabled:true,rungs:[]}]});
+  backups.push({name:"ladder-20261028-030000-nightly.json", mtime: now - 86400*1.4, doc:{type:"ha_ladder_backup", version:"0.3.0", created:"2026-10-28T03:00:00", programs: old}});
+}
 let traceSigs = ["binary_sensor.hallway_motion", "sensor.hallway_temperature", "#T1.ET", "climate.living"];
 const traceBuf = {}; const T0 = Date.now()/1000 - 900;
 for (const s of traceSigs) traceBuf[s] = [];
@@ -60,7 +73,14 @@ const hass = {
     "light.hallway":{area_id:"hall"}, "binary_sensor.kitchen_motion":{area_id:"kitchen"}, "light.kitchen_downlights":{area_id:"kitchen"}, "climate.living":{area_id:"living"}, "sensor.hallway_temperature":{device_id:"d1"}},
   callWS: async (m) => { calls.push(m);
     if (m.type==="ha_ladder/get") return {programs: JSON.parse(JSON.stringify(sample)), settings:{scan_ms:250}, running:true};
-    if (m.type==="ha_ladder/save") { saved = m.programs; return {ok:true}; }
+    if (m.type==="ha_ladder/save") { saved = m.programs; const v = {id: "v" + (versions.length+1), ts: Date.now()/1000, note: m.note||"", source: m.source||"save", pinned:false, summary:{programs:m.programs.length, rungs:m.programs.reduce((a,p)=>a+p.rungs.length,0)}, programs: JSON.parse(JSON.stringify(m.programs))}; versions.unshift(v); return {ok:true, version:v.id}; }
+    if (m.type==="ha_ladder/history/list") return {versions: versions.map(({programs, ...x}) => x)};
+    if (m.type==="ha_ladder/history/get") return versions.find(v => v.id === m.version);
+    if (m.type==="ha_ladder/history/update") { const v = versions.find(v => v.id === m.version); if (m.note !== undefined) v.note = m.note; if (m.pinned !== undefined) v.pinned = m.pinned; return v; }
+    if (m.type==="ha_ladder/history/delete") { versions.splice(versions.findIndex(v => v.id === m.version), 1); return {ok:true}; }
+    if (m.type==="ha_ladder/backup/list") return {folder: "/config/ladder_backups", backups: backups.map(b => ({name: b.name, size: 4321, mtime: b.mtime}))};
+    if (m.type==="ha_ladder/backup/create") { const b = {name: "ladder-20261029-1200" + backups.length + ".json", mtime: Date.now()/1000, doc: {type:"ha_ladder_backup", created:"2026-10-29T12:00:00", programs: JSON.parse(JSON.stringify(versions[0].programs))}}; backups.unshift(b); return b; }
+    if (m.type==="ha_ladder/backup/get") return backups.find(b => b.name === m.name).doc;
     if (m.type==="ha_ladder/force") { forces[m.name] = m.value; push(); return {key:m.name}; }
     if (m.type==="ha_ladder/unforce") { if (m.name) delete forces[m.name]; else for (const k in forces) delete forces[k]; push(); return {ok:true}; }
     if (m.type==="ha_ladder/set_memory") { mem[m.name.replace(/^#/,"")] = m.value; push(); return {ok:true}; }

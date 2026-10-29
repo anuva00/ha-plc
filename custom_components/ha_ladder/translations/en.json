@@ -24,6 +24,20 @@
           "description": "true/false, a number, or text."
         }
       }
+    },
+    "backup": {
+      "name": "Back up programs",
+      "description": "Write all ladder programs, settings and retentive data to /config/ladder_backups as a JSON file.",
+      "fields": {
+        "keep": {
+          "name": "Keep",
+          "description": "Delete older backup files so only this many are kept."
+        },
+        "label": {
+          "name": "Label",
+          "description": "Text added to the file name."
+        }
+      }
     }
   }
 }

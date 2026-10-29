@@ -52,6 +52,21 @@ lock lock/unlock, scene/button activate, vacuum start/dock, lawn_mower mow/dock.
 Numbers written with MOVE/MATH: input_number/number value, light brightness %,
 cover position, fan %, climate setpoint, media_player volume (0–1).
 
+## History & backups
+**Every Save is a version.** The History page lists them (newest 50, plus any you pin ★, which are kept forever). Each version has a time, an optional note (shift-click **Save** to add one, or type it on the History page) and a summary. Select a version to see exactly what restoring it would change compared with the running version, rung by rung: rungs added/removed/moved, comment changes, element parameter changes (`TOF T1: pt "120" → "60"`), elements added/removed, and wiring changes.
+* **Restore** replaces the running programs immediately. The current version stays in History, so a restore can always be undone by restoring again.
+* **Open in editor** loads a version into the editor without running it (Ctrl+Z goes back), so you can look around or copy bits.
+* **Download JSON** for any version.
+
+**File backups** go to `/config/ladder_backups/` (so they're also inside Home Assistant's own backups). Use **Back up now**, or automate with the `ha_ladder.backup` action:
+```yaml
+action: ha_ladder.backup
+data:
+  keep: 30        # optional: delete older files
+  label: nightly  # optional: added to the file name
+```
+Any backup file (from the folder or uploaded from your computer) can be previewed with the same diff and restored.
+
 ## Test mode
 🧪 **Test** in the toolbar (or `switch.ladder_logic_plc_test_mode`) runs the program normally, but outputs and actions are only simulated: nothing in the house is switched and no notifications are sent. Simulated outputs read back to the program (so latches work), show in purple as "(sim)" in the ladder and on the Tags/Trace pages, and the Watch panel lists every simulated output change and action. When you leave test mode, the next scan applies the program's outputs to the real devices.
 

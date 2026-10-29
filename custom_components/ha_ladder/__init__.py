@@ -11,7 +11,7 @@ from homeassistant.components.frontend import async_remove_panel
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, Platform
-from homeassistant.core import CoreState, Event, HomeAssistant, ServiceCall
+from homeassistant.core import CoreState, Event, HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.helpers import config_validation as cv
 
 from .const import DOMAIN, PANEL_ELEMENT, PANEL_URL, STATIC_URL, VERSION
@@ -62,6 +62,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: LadderConfigEntry) -> bo
         schema=vol.Schema({vol.Required("name"): cv.string, vol.Required("value"): vol.Any(bool, vol.Coerce(float), cv.string)}),
     )
 
+    async def backup(call: ServiceCall) -> dict:
+        return await controller.async_backup(call.data.get("keep"), call.data.get("label", ""))
+
+    hass.services.async_register(
+        DOMAIN,
+        "backup",
+        backup,
+        schema=vol.Schema({vol.Optional("keep"): vol.All(int, vol.Range(min=1, max=1000)), vol.Optional("label"): cv.string}),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
     # Only start scanning once every integration has loaded, otherwise the
     # first scan would see half the house as "unavailable".
     if controller.settings.get("running", True):
@@ -80,5 +91,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: LadderConfigEntry) -> b
     await entry.runtime_data.async_shutdown()
     async_remove_panel(hass, PANEL_URL)
     hass.services.async_remove(DOMAIN, "set_marker")
+    hass.services.async_remove(DOMAIN, "backup")
     hass.data.pop(DOMAIN, None)
     return ok

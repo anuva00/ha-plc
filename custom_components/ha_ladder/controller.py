@@ -21,6 +21,7 @@ from .const import (
     STORE_RETAIN,
 )
 from .engine import Runtime, validate_programs
+from .history import History
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -92,6 +93,8 @@ class LadderController:
         self.runtime.load(self.programs)
         self.runtime.simulate = bool(self.settings.get("simulate", False))
         self._trace_config(self.settings.get("trace") or [])
+        self.history = History(self.hass)
+        await self.history.async_load(self.programs)
 
     @property
     def running(self) -> bool:
@@ -144,12 +147,19 @@ class LadderController:
             self.async_stop()
 
     # -- editing ---------------------------------------------------------------
-    async def async_save_programs(self, programs: list[dict]) -> None:
+    async def async_save_programs(self, programs: list[dict], note: str = "", source: str = "save") -> dict | None:
         validate_programs(programs)
         self.programs = programs
         self.runtime.load(programs)
         self._logged_errors.clear()
         await self._save()
+        return await self.history.async_record(programs, note, source)
+
+    def backup_payload(self) -> dict:
+        return {"programs": self.programs, "settings": self.settings, "retain": self.runtime.retain_data()}
+
+    async def async_backup(self, keep: int | None = None, label: str = "") -> dict:
+        return await self.history.async_backup(self.backup_payload(), keep, label)
 
     async def async_set_scan_ms(self, ms: int) -> None:
         self.settings["scan_ms"] = int(min(MAX_SCAN_MS, max(MIN_SCAN_MS, ms)))

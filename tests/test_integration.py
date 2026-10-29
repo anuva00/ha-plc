@@ -142,3 +142,56 @@ async def test_static_js_served(hass, hass_client):
     resp = await client.get("/ha_ladder_static/ladder-panel.js")
     assert resp.status == 200
     assert "ha-ladder-panel" in await resp.text()
+
+
+async def test_history_and_backups(hass: HomeAssistant, hass_ws_client, tmp_path, monkeypatch):
+    entry = await _setup(hass)
+    ws = await hass_ws_client(hass)
+    n = [100]
+
+    async def call(msg):
+        n[0] += 1
+        await ws.send_json({"id": n[0], **msg})
+        while True:
+            r = await ws.receive_json()
+            if r.get("id") == n[0] and r.get("type") == "result":
+                return r
+
+    r = await call({"type": "ha_ladder/history/list"})
+    assert len(r["result"]["versions"]) == 1 and r["result"]["versions"][0]["source"] == "initial"
+    p = prog()
+    r = await call({"type": "ha_ladder/save", "programs": p, "note": "first real program"})
+    v1 = r["result"]["version"]
+    assert v1
+    # identical save doesn't create a version
+    r = await call({"type": "ha_ladder/save", "programs": p})
+    assert r["result"]["version"] is None
+    p2 = prog(); p2[0]["rungs"][0]["comment"] = "changed"
+    await call({"type": "ha_ladder/save", "programs": p2})
+    vers = (await call({"type": "ha_ladder/history/list"}))["result"]["versions"]
+    assert [v["note"] for v in vers][:2] == ["", "first real program"]
+    # pin, note, get, delete rules
+    await call({"type": "ha_ladder/history/update", "version": v1, "pinned": True, "note": "known good"})
+    got = (await call({"type": "ha_ladder/history/get", "version": v1}))["result"]
+    assert got["pinned"] and got["note"] == "known good" and got["programs"][0]["rungs"][0]["comment"] == ""
+    r = await call({"type": "ha_ladder/history/delete", "version": vers[0]["id"]})
+    assert not r["success"]  # newest can't be deleted
+    # retention: 60 more saves keep 50 unpinned + the pinned one
+    for i in range(60):
+        q = prog(); q[0]["rungs"][0]["comment"] = f"v{i}"
+        await call({"type": "ha_ladder/save", "programs": q})
+    vers = (await call({"type": "ha_ladder/history/list"}))["result"]["versions"]
+    assert len(vers) == 51 and any(v["id"] == v1 for v in vers)
+    # file backups
+    monkeypatch.setattr(hass.config, "config_dir", str(tmp_path))
+    b = (await call({"type": "ha_ladder/backup/create", "label": "test"}))["result"]
+    assert b["name"].startswith("ladder-") and (tmp_path / "ladder_backups" / b["name"]).exists()
+    lst = (await call({"type": "ha_ladder/backup/list"}))["result"]["backups"]
+    assert lst[0]["name"] == b["name"]
+    doc = (await call({"type": "ha_ladder/backup/get", "name": b["name"]}))["result"]
+    assert doc["type"] == "ha_ladder_backup" and doc["programs"][0]["rungs"][0]["comment"] == "v59"
+    r = await call({"type": "ha_ladder/backup/get", "name": "../secrets.yaml"})
+    assert not r["success"]
+    res = await hass.services.async_call("ha_ladder", "backup", {"keep": 1}, blocking=True, return_response=True)
+    assert len(list((tmp_path / "ladder_backups").glob("ladder-*.json"))) == 1 and res["name"].endswith(".json")
+    assert await hass.config_entries.async_unload(entry.entry_id)

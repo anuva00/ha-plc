@@ -10,3 +10,16 @@ set_marker:
       example: true
       selector:
         text:
+backup:
+  fields:
+    keep:
+      example: 30
+      selector:
+        number:
+          min: 1
+          max: 1000
+          mode: box
+    label:
+      example: "nightly"
+      selector:
+        text:
